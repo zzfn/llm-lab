@@ -18,6 +18,7 @@
   .msg { max-width: 78%; padding: 10px 14px; border-radius: 10px; white-space: pre-wrap; word-break: break-word; }
   .user { align-self: flex-end; background: #0969da; color: #fff; }
   .assistant { align-self: flex-start; background: #fff; border: 1px solid #d0d7de; }
+  .think { font-size: 12px; color: #57606a; background: #f6f8fa; border-left: 3px solid #d0d7de; padding: 6px 10px; margin-bottom: 8px; border-radius: 4px; }
   form { display: flex; gap: 8px; padding: 12px 16px; background: #fff; border-top: 1px solid #d0d7de; }
   textarea { flex: 1; resize: none; padding: 8px 10px; border: 1px solid #d0d7de; border-radius: 6px; font: inherit; }
   button { padding: 8px 16px; border: 0; border-radius: 6px; background: #0969da; color: #fff; cursor: pointer; }
@@ -35,6 +36,13 @@
       <select id="mode">
         <option value="chat">对话 (Chat)</option>
         <option value="complete">续写 (Completion)</option>
+      </select>
+    </label>
+    <label>自适应思考 (enable_thinking)
+      <select id="thinking">
+        <option value="auto">自适应 (auto)</option>
+        <option value="true">开启思考 (&lt;think&gt;)</option>
+        <option value="false">关闭思考 (快答)</option>
       </select>
     </label>
     <label>温度 (Temperature)
@@ -79,10 +87,18 @@ document.getElementById("form").addEventListener("submit", async (e) => {
   if (!text) return;
   document.getElementById("input").value = "";
   const mode = document.getElementById("mode").value;
+  const thinkVal = document.getElementById("thinking").value;
+  const enableThinking = thinkVal === "auto" ? null : thinkVal === "true";
   const temp = parseFloat(document.getElementById("temp").value || "0");
   const maxTokens = parseInt(document.getElementById("maxTokens").value || "96", 10);
   appendMsg("user", text);
   const outEl = appendMsg("assistant", "");
+  const thinkEl = document.createElement("div");
+  thinkEl.className = "think";
+  thinkEl.style.display = "none";
+  const bodyEl = document.createElement("div");
+  outEl.appendChild(thinkEl);
+  outEl.appendChild(bodyEl);
   controller = new AbortController();
   document.getElementById("sendBtn").textContent = "停止";
   try {
@@ -92,26 +108,32 @@ document.getElementById("form").addEventListener("submit", async (e) => {
         body: JSON.stringify({ prompt: text, temperature: temp, max_tokens: maxTokens }), signal: controller.signal
       });
       const d = await r.json();
-      outEl.textContent = d.choices[0].text;
+      bodyEl.textContent = d.choices[0].text;
     } else {
       history.push({ role: "user", content: text });
       const r = await fetch("/v1/chat/completions", {
         method: "POST", headers: {"Content-Type": "application/json"},
-        body: JSON.stringify({ messages: history, temperature: temp, max_tokens: maxTokens, stream: true }), signal: controller.signal
+        body: JSON.stringify({ messages: history, temperature: temp, max_tokens: maxTokens, enable_thinking: enableThinking, stream: true }), signal: controller.signal
       });
       const reader = r.body.getReader();
       const dec = new TextDecoder();
-      let buf = "", full = "";
+      let buf = "", full = "", fullThink = "";
       while (true) {
         const { value, done } = await reader.read();
         if (done) break;
         buf += dec.decode(value, { stream: true });
         for (const line of buf.split("\n\n")) {
           if (!line.startsWith("data: ") || line === "data: [DONE]") continue;
-          const obj = JSON.parse(line.slice(6));
-          const delta = obj.choices[0].delta.content || "";
-          full += delta;
-          outEl.textContent = full;
+          const deltaObj = JSON.parse(line.slice(6)).choices[0].delta;
+          if (deltaObj.reasoning_content) {
+            fullThink += deltaObj.reasoning_content;
+            thinkEl.style.display = "block";
+            thinkEl.textContent = "思考：" + fullThink;
+          }
+          if (deltaObj.content) {
+            full += deltaObj.content;
+            bodyEl.textContent = full;
+          }
         }
         buf = buf.endsWith("\n\n") ? "" : buf.slice(buf.lastIndexOf("\n\n") + 2);
       }

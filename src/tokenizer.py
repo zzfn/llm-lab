@@ -20,6 +20,8 @@ SPECIAL_TOKENS = [
     "<|im_end|>",
     "<|tool_call|>",
     "<|/tool_call|>",
+    "<think>",
+    "</think>",
 ]
 
 
@@ -88,6 +90,14 @@ class ByteBPETokenizer:
     @property
     def tool_call_end_id(self) -> int:
         return self.special_to_id["<|/tool_call|>"]
+
+    @property
+    def think_id(self) -> int:
+        return self.special_to_id["<think>"]
+
+    @property
+    def think_end_id(self) -> int:
+        return self.special_to_id["</think>"]
 
     @classmethod
     def train(cls, texts: list[str], vocab_size: int = 512) -> "ByteBPETokenizer":

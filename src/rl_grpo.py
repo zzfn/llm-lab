@@ -15,7 +15,7 @@ import torch
 from .generate import generate_ids
 from .loss import token_log_probs
 from .tokenizer import ByteBPETokenizer
-from .utils import build_optimizers, format_chat_prompt, format_tool_turn, load_ckpt, parse_tool_calls, pick_device, save_ckpt, step_all
+from .utils import build_optimizers, format_chat_prompt, format_tool_turn, load_ckpt, parse_tool_calls, pick_device, save_ckpt, split_thinking, step_all
 
 ANS_RE = re.compile(r"####\s*(-?\d+)")
 CHOICE_RE = re.compile(r"(?:答案[：:\s]*)?\b([A-D])\b")
@@ -92,6 +92,7 @@ def score_judge(prompt: str, response: str, judge_url: str, judge_model: str) ->
 
 
 def score_task(task: dict, final_text: str, broken_count: int, judge_url: str = "", judge_model: str = "") -> float:
+    _, final_text = split_thinking(final_text)
     kind = task.get("reward", "agent")
     if kind == "agent":
         m = ANS_RE.search(final_text)

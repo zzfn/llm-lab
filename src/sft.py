@@ -8,6 +8,7 @@ from pathlib import Path
 
 import torch
 
+from .lora import apply_lora, merge_lora, save_lora_only
 from .tokenizer import ByteBPETokenizer
 from .utils import build_optimizers, format_chat_sft, load_ckpt, lr_schedule, pick_device, save_ckpt, set_lr_factor, step_all
 
@@ -65,7 +66,11 @@ def train(args) -> dict:
         stem = Path(args.data).stem
         out_path = f"out/{stem.removeprefix('sft_')}/ckpt.pt" if stem.startswith("sft_expert_") else "out/sft/ckpt.pt"
 
-    optimizers = build_optimizers(model, opt_name=args.optimizer, lr_mult=args.lr_mult)
+    if args.lora_rank > 0:
+        trainable, total = apply_lora(model, rank=args.lora_rank, alpha=args.lora_alpha)
+        print(f"[LoRA] rank={args.lora_rank} alpha={args.lora_alpha} trainable={trainable:,}/{total:,} ({trainable/total:.2%})")
+
+    optimizers = build_optimizers(model, opt_name="adamw" if args.lora_rank > 0 else args.optimizer, lr_mult=args.lr_mult)
     print(f"[SFT] init={init_path} data={args.data} train={len(train_ex)} val={len(val_ex)} steps={args.steps} -> {out_path}")
 
     model.train()
@@ -93,17 +98,29 @@ def train(args) -> dict:
             model.train()
             print(f"step {step+1:>4}/{args.steps} | train_loss {loss.item():.4f} | val_loss {last_val:.4f}")
 
-    save_ckpt(out_path, model, args.steps, stage="sft", extra={"val_loss": last_val})
+    if args.lora_rank > 0:
+        lora_path = str(Path(out_path).with_name("lora.pt"))
+        save_lora_only(model, lora_path)
+        print(f"LoRA 增量权重已保存至 {lora_path}")
+        if args.lora_merge:
+            merge_lora(model)
+            print("已完成 LoRA 无损合并 (W + B@A * scaling)")
+
+    save_ckpt(out_path, model, args.steps, stage="sft", extra={"val_loss": last_val, "lora_rank": args.lora_rank})
     print(f"SFT 完成，权重已保存至 {out_path}")
     return {"train_loss": loss.item(), "val_loss": last_val, "out": out_path}
 
 
 def main():
-    p = argparse.ArgumentParser(description="通用 SFT 与领域专家 SFT")
+    p = argparse.ArgumentParser(description="通用 SFT / LoRA 微调 / 领域专家 SFT")
     p.add_argument("--init", default="", help="起始权重；默认优先用 out/anneal/ckpt.pt，其次 out/pretrain/ckpt.pt")
     p.add_argument("--data", default="data/sft.jsonl")
     p.add_argument("--tokenizer", default="data/tokenizer.json")
     p.add_argument("--out", default="", help="输出路径；专家数据默认写到 out/expert_<domain>/ckpt.pt")
+    p.add_argument("--lora-rank", type=int, default=0, help=">0 时启用 LoRA 微调（冻结基座只训低秩旁路）")
+    p.add_argument("--lora-alpha", type=float, default=16.0)
+    p.add_argument("--no-lora-merge", dest="lora_merge", action="store_false", help="不合并直接保留（默认训练后自动无损合并到 ckpt）")
+    p.set_defaults(lora_merge=True)
     p.add_argument("--optimizer", default="muon", choices=["muon", "adamw"])
     p.add_argument("--lr-mult", type=float, default=0.2)
     p.add_argument("--steps", type=int, default=200)

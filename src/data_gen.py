@@ -115,7 +115,7 @@ def build_datasets(out_dir: Path, vocab_size: int = 768, seed: int = 42) -> None
     expert_math, expert_qa, general_sft = [], [], []
     for _ in range(80):
         for q, a in QA_PAIRS:
-            row = {"messages": [{"role": "user", "content": q}, {"role": "assistant", "content": a}]}
+            row = {"messages": [{"role": "user", "content": q}, {"role": "assistant", "thinking": f"先回忆核心定义再作答：{q[:12]}", "content": a}]}
             expert_qa.append(row)
             general_sft.append(row)
     for prompt, _, ans_text in INSTRUCT_SAMPLES:
@@ -181,7 +181,27 @@ def build_datasets(out_dir: Path, vocab_size: int = 768, seed: int = 42) -> None
         })
     _write_jsonl(out_dir / "rl_tasks.jsonl", rl_rows)
 
-    # 5. 训练分词器
+    # 5. 生成 DPO 偏好对（chosen=规范调用工具/准确作答，rejected=瞎猜或格式错误）
+    dpo_rows: list[dict] = []
+    for _ in range(120):
+        prompt, expr, ans, msgs = make_tool_task(rng)
+        wrong_ans = ans + rng.choice([1, -1, 10])
+        dpo_rows.append({
+            "chosen": msgs,
+            "rejected": [
+                {"role": "system", "content": "你可以使用工具 calc(expr) 计算算术表达式。"},
+                {"role": "user", "content": prompt},
+                {"role": "assistant", "content": f"直接猜一下结果是 {wrong_ans}。"},
+            ],
+        })
+    for q, a in QA_PAIRS * 10:
+        dpo_rows.append({
+            "chosen": [{"role": "user", "content": q}, {"role": "assistant", "thinking": "按核心原理回答。", "content": a}],
+            "rejected": [{"role": "user", "content": q}, {"role": "assistant", "content": "这个问题不太清楚，大概随便设置一下就行。"}],
+        })
+    _write_jsonl(out_dir / "dpo.jsonl", dpo_rows)
+
+    # 6. 训练分词器
     sample_texts = pretrain_lines[:800] + [m["content"] for r in general_sft[:250] for m in r["messages"]]
     tok = ByteBPETokenizer.train(sample_texts, vocab_size=vocab_size)
     tok.save(out_dir / "tokenizer.json")
@@ -189,6 +209,7 @@ def build_datasets(out_dir: Path, vocab_size: int = 768, seed: int = 42) -> None
         f"数据准备完成: {out_dir}\n"
         f"  pretrain.txt:       {len(pretrain_lines)} 行\n"
         f"  sft.jsonl:          {len(general_sft)} 条（另含 expert_math {len(expert_math)} / expert_qa {len(expert_qa)}）\n"
+        f"  dpo.jsonl:          {len(dpo_rows)} 对\n"
         f"  mopd_prompts.jsonl: {len(mopd_prompts)} 道\n"
         f"  rl_tasks.jsonl:     {len(rl_rows)} 题（agent + instruct + choice）\n"
         f"  tokenizer:          vocab_size={tok.vocab_size}"

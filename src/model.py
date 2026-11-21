@@ -31,6 +31,8 @@ class ModelConfig:
     ffn_type: str = "relu2"        # "relu2" 或 "swiglu"
     qk_norm: bool = True
     rope_base: float = 10000.0
+    rope_orig_max_len: int = 0     # YaRN 原始预训练上下文长度（0 表示不做外推缩放）
+    rope_yarn_factor: float = 1.0  # YaRN 外推倍率（>1.0 且 max_seq_len > rope_orig_max_len 时生效）
     tie_embeddings: bool = False
     norm_eps: float = 1e-6
 
@@ -125,11 +127,27 @@ class RMSNorm(nn.Module):
         return normed.to(x.dtype) * self.weight
 
 
-def precompute_rope(head_dim: int, max_seq_len: int, base: float = 10000.0) -> tuple[torch.Tensor, torch.Tensor]:
+def precompute_rope(
+    head_dim: int,
+    max_seq_len: int,
+    base: float = 10000.0,
+    orig_max_len: int = 0,
+    yarn_factor: float = 1.0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """预计算 RoPE (cos, sin)。当 yarn_factor > 1 且超出 orig_max_len 时启用 YaRN 线性斜坡外推。"""
     inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim))
+    attn_factor = 1.0
+    if yarn_factor > 1.0 and orig_max_len > 0 and max_seq_len > orig_max_len:
+        beta_fast, beta_slow = 32.0, 1.0
+        inv_dim = lambda b: (head_dim * math.log(orig_max_len / (b * 2 * math.pi))) / (2 * math.log(base))
+        low = max(math.floor(inv_dim(beta_fast)), 0)
+        high = min(math.ceil(inv_dim(beta_slow)), head_dim // 2 - 1)
+        ramp = torch.clamp((torch.arange(head_dim // 2, dtype=torch.float32) - low) / max(high - low, 0.001), 0.0, 1.0)
+        inv_freq = inv_freq * (1.0 - ramp + ramp / yarn_factor)
+        attn_factor = 0.1 * math.log(yarn_factor) + 1.0
     pos = torch.arange(max_seq_len, dtype=torch.float32)
     freqs = torch.outer(pos, inv_freq)
-    return freqs.cos(), freqs.sin()
+    return freqs.cos() * attn_factor, freqs.sin() * attn_factor
 
 
 def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
@@ -472,7 +490,7 @@ class MiniLLM(nn.Module):
         if cfg.tie_embeddings:
             self.head.weight = self.embed.weight
 
-        cos, sin = precompute_rope(cfg.head_dim, cfg.max_seq_len, cfg.rope_base)
+        cos, sin = precompute_rope(cfg.head_dim, cfg.max_seq_len, cfg.rope_base, cfg.rope_orig_max_len, cfg.rope_yarn_factor)
         self.register_buffer("rope_cos", cos, persistent=False)
         self.register_buffer("rope_sin", sin, persistent=False)
         self.reset_parameters()

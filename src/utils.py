@@ -122,7 +122,10 @@ def step_all(model: MiniLLM, optimizers: list[torch.optim.Optimizer]) -> None:
 
 
 def encode_message_body(tok: ByteBPETokenizer, msg: dict) -> list[int]:
-    body = tok.encode_ordinary(msg.get("content", ""))
+    body: list[int] = []
+    if msg.get("thinking"):
+        body.extend([tok.think_id] + tok.encode_ordinary(msg["thinking"]) + [tok.think_end_id])
+    body.extend(tok.encode_ordinary(msg.get("content", "")))
     for call in msg.get("tool_calls") or []:
         call_json = json.dumps(call, ensure_ascii=False)
         body.extend([tok.tool_call_id] + tok.encode_ordinary(call_json) + [tok.tool_call_end_id])
@@ -136,7 +139,7 @@ def format_chat_sft(
     train_on: str = "assistant",
 ) -> tuple[list[int], list[int]]:
     """把多轮对话编码成 (input_ids, loss_mask)。
-    - train_on="assistant": 仅 assistant 的正文、tool_calls 与 <|im_end|> mask=1；其余全为 0
+    - train_on="assistant": 仅 assistant 的思考、正文、tool_calls 与 <|im_end|> mask=1；其余全为 0
     - train_on="all": 整段均算损失（退火混入对话数据时使用）
     """
     ids: list[int] = []
@@ -154,14 +157,35 @@ def format_chat_sft(
     return ids, mask
 
 
-def format_chat_prompt(tok: ByteBPETokenizer, messages: list[dict]) -> list[int]:
+def format_chat_prompt(
+    tok: ByteBPETokenizer,
+    messages: list[dict],
+    enable_thinking: bool | None = None,
+) -> list[int]:
+    """构造提示词前缀，支持自适应思考开关（True 强制开启 <think>，False 跳过思考，None 模型自决）。"""
     ids: list[int] = []
     nl = tok.encode_ordinary("\n")
     for msg in messages:
         ids.extend([tok.im_start_id] + tok.encode_ordinary(f"{msg['role']}\n"))
         ids.extend(encode_message_body(tok, msg) + nl)
     ids.extend([tok.im_start_id] + tok.encode_ordinary("assistant\n"))
+    if enable_thinking is True:
+        ids.append(tok.think_id)
+    elif enable_thinking is False:
+        ids.extend([tok.think_id, tok.think_end_id])
     return ids
+
+
+def split_thinking(text: str) -> tuple[str, str]:
+    """拆分 <think>...</think> 思考过程与最终正文，返回 (reasoning_content, content)。"""
+    if "<think>" in text and "</think>" in text:
+        start = text.index("<think>") + len("<think>")
+        end = text.index("</think>", start)
+        return text[start:end].strip(), (text[: text.index("<think>")] + text[end + len("</think>") :]).strip()
+    if "</think>" in text:
+        end = text.index("</think>")
+        return text[:end].strip(), text[end + len("</think>") :].strip()
+    return "", text.strip()
 
 
 def format_tool_turn(tok: ByteBPETokenizer, result_text: str) -> list[int]:
@@ -202,9 +226,10 @@ def parse_tool_calls(tok: ByteBPETokenizer, resp_ids: list[int]) -> tuple[str, l
                 broken.append(tok.decode(ids[i + 1 :], skip_special=True))
                 break
         else:
-            text_ids.append(ids[i])
+            if ids[i] not in (tok.pad_id, tok.bos_id, tok.eos_id, tok.im_start_id, tok.im_end_id):
+                text_ids.append(ids[i])
             i += 1
-    return tok.decode(text_ids, skip_special=True), calls, broken
+    return tok.decode(text_ids, skip_special=False), calls, broken
 
 
 def save_ckpt(

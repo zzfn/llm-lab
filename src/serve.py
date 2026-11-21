@@ -21,7 +21,7 @@ import torch
 
 from .generate import stream_ids
 from .tokenizer import ByteBPETokenizer
-from .utils import format_chat_prompt, load_ckpt, parse_tool_calls, pick_device
+from .utils import format_chat_prompt, load_ckpt, parse_tool_calls, pick_device, split_thinking
 
 PAGE = Path(__file__).parent / "web" / "chat.html"
 BASE_STAGES = ("pretrain", "anneal")
@@ -75,7 +75,8 @@ class Service:
 
     def chat(self, body: dict) -> dict:
         msgs = to_internal_messages(body.get("messages", []), body.get("tools"))
-        prompt_ids = format_chat_prompt(self.tok, msgs)
+        enable_thinking = body.get("enable_thinking", None)
+        prompt_ids = format_chat_prompt(self.tok, msgs, enable_thinking=enable_thinking)
         max_tokens = int(body.get("max_tokens", 128))
         temperature = float(body.get("temperature", 0.0))
         top_k = int(body.get("top_k", 40))
@@ -84,8 +85,13 @@ class Service:
             gen = self._run_tokens(prompt_ids, max_tokens, temperature, top_k, self.tok.im_end_id)
 
         finished = bool(gen and gen[-1] == self.tok.im_end_id)
-        text, calls, _ = parse_tool_calls(self.tok, gen)
-        message: dict = {"role": "assistant", "content": text}
+        raw_text, calls, _ = parse_tool_calls(self.tok, gen)
+        if enable_thinking is True and "<think>" not in raw_text and "</think>" in raw_text:
+            raw_text = "<think>" + raw_text
+        reasoning, content = split_thinking(raw_text)
+        message: dict = {"role": "assistant", "content": content}
+        if reasoning:
+            message["reasoning_content"] = reasoning
         finish_reason = "stop" if finished else "length"
         if calls:
             message["tool_calls"] = [
@@ -109,7 +115,8 @@ class Service:
 
     def chat_stream(self, body: dict, write_sse) -> None:
         msgs = to_internal_messages(body.get("messages", []), body.get("tools"))
-        prompt_ids = format_chat_prompt(self.tok, msgs)
+        enable_thinking = body.get("enable_thinking", None)
+        prompt_ids = format_chat_prompt(self.tok, msgs, enable_thinking=enable_thinking)
         max_tokens = int(body.get("max_tokens", 128))
         temperature = float(body.get("temperature", 0.0))
         top_k = int(body.get("top_k", 40))
@@ -121,18 +128,26 @@ class Service:
             x = torch.tensor([prompt_ids], dtype=torch.long, device=self.device)
             buf: list[int] = []
             prev_text = ""
+            in_think = enable_thinking is True
             finished = False
             for tid in stream_ids(self.model, x, max_new_tokens=max_tokens, temperature=temperature, top_k=top_k, eos_id=self.tok.im_end_id):
                 if tid == self.tok.im_end_id:
                     finished = True
                     break
+                if tid == self.tok.think_id:
+                    in_think = True
+                    continue
+                if tid == self.tok.think_end_id:
+                    in_think = False
+                    continue
                 buf.append(tid)
-                cur_text = self.tok.decode(buf, skip_special=False)
+                cur_text = self.tok.decode(buf, skip_special=True)
                 delta = cur_text[len(prev_text) :]
                 if delta and "\ufffd" not in delta:
                     prev_text = cur_text
+                    field = "reasoning_content" if in_think else "content"
                     if not write_sse({"id": cid, "object": "chat.completion.chunk", "created": int(time.time()), "model": self.info["name"],
-                                      "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": None}]}):
+                                      "choices": [{"index": 0, "delta": {field: delta}, "finish_reason": None}]}):
                         return
         write_sse({"id": cid, "object": "chat.completion.chunk", "created": int(time.time()), "model": self.info["name"],
                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop" if finished else "length"}]})

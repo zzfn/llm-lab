@@ -44,3 +44,15 @@
   - **PPO**：需要一个同等参数量的 Critic 网络估计状态价值 $V(s)$，显存与训练成本极高。
   - **GRPO**：对同一提示词采样一组 $G$ 个回答，用组内奖励均值和标准差归一化算 Advantage：$A_i = (r_i - \mu) / \sigma$，去掉了 Critic。
   - **Dr. GRPO**：针对 GRPO 的两个偏差做修正——① **去掉除以 $\sigma$**，避免组内奖励方差极小时过度放大简单题/难题的梯度权重；② **损失分母改用常数 $N \cdot L_{\max}$** 而非回答实际长度 $|y_i|$，消除模型在答错时倾向于输出长废话来稀释单 token 惩罚的 length bias。
+
+---
+
+### 5. 生态与扩展机制（对应 `src/lora.py`, `src/dpo.py`, `src/model.py`）
+- **Q: LoRA 为什么把 $A$ 高斯初始化、$B$ 全零初始化？推理时怎么做到零额外延迟？**
+  - $\Delta W = B A$。训练开始前 $B=0$ 保证初始增量严格为 0，模型行为与原基座完全一致（见 `test_lora_zero_init_and_lossless_merge`）；若两矩阵全 0 会导致对称性死锁梯度无法回传，所以 $A$ 用高斯初始化。训练完成后执行 `merge_lora`，将 $\frac{\alpha}{r} B A$ 直接加回 $W$，推理时就是普通 `nn.Linear`，没有任何额外计算开销。
+- **Q: DPO 相比 PPO / GRPO 的定位区别？**
+  - **DPO** 是离线偏好对优化（不需要在线采样也不需要 Reward Model），直接用成对 `(chosen, rejected)` 数据对比冻结 `ref_model` 的概率比；适合有现成人类偏好对比数据的场景。而 **GRPO / Dr. GRPO** 是在线强化学习，适合算术、代码、工具调用等“能自动判对错、需要模型自己探索出正确轨迹”的任务。
+- **Q: YaRN 为什么能让 RoPE 外推到比训练长度更长的上下文？**
+  - RoPE 不同维度对应不同旋转频率：高频维负责邻近词的精细相对位置，外推时不能动；低频维周期长，超出训练长度后会出现未见过的相位角度。YaRN 按波长划分高低频区间，用线性斜坡（ramp）保留高频、仅按倍率压缩低频，再微调注意力温度缩放因子，即可外推长上下文。
+- **Q: `enable_thinking` 和 `reasoning_content` 在底层是怎么实现的？**
+  - 通过预留 `<think>` 与 `</think>` 控制符：开启时在 `assistant\n` 后强制拼 `<think>` 引导模型先写推理链；关闭时拼 `<think></think>` 让模型直接跳到正文输出；服务端流式/非流式解析时将 `<think>` 内部 token 拆到 `reasoning_content`，之后内容拆到 `content`。

@@ -41,11 +41,12 @@ token id ─┬─ Embedding ─────────────────
 | **Byte-BPE 分词器** | 纯 Python 字节级 BPE（永不 `<unk>`），普通输入禁止解析 `<|im_start|>` / `<|tool_call|>` 防注入 | [src/tokenizer.py](src/tokenizer.py) |
 | **mHC 多流残差** | `n_streams=4`，注意力入口/出口，20 步对数域 Sinkhorn 约束流间混合矩阵为双随机矩阵 | [src/model.py](src/model.py) |
 | **Engram 查表记忆** | 2/3-gram 多头互异质数模长哈希查表，支持逐词生成的历史缓存与层间门控注入 | [src/model.py](src/model.py) |
-| **3:1 滑动窗口 GQA** | 每 4 层前 3 层只看最近 `window` 个词，第 4 层及末层看全文；含 QK-Norm、RoPE 与完整 KV Cache | [src/model.py](src/model.py) |
+| **3:1 滑动窗口 GQA + YaRN** | 每 4 层前 3 层只看最近 `window` 个词，末层看全文；含 QK-Norm、RoPE + YaRN 长文本外推与 KV Cache | [src/model.py](src/model.py) |
 | **MoE 混合专家** | `nano_moe` 预设：首层 Dense，其余层 `共享专家 + 8 选 2 路由专家`，无梯度偏置均衡 + 轻均衡损失 | [src/model.py](src/model.py) |
 | **防塌缩稳定交叉熵** | 按 `arXiv:2610.31642 v3` 实现 `m = -LSE(z_j - z_t)`, `softplus(-m)`，支持分块算损与饱和率监控 | [src/loss.py](src/loss.py) |
 | **Muon + WSD** | 二维矩阵使用 5 步 Newton-Schulz 正交化 `Muon`，其余参数用 `AdamW`；支持 WSD 分支退火 | [src/muon.py](src/muon.py), [src/pretrain.py](src/pretrain.py) |
-| **SFT & 领域专家** | ChatML + `<|tool_call|>` 格式，精确屏蔽 `system` / `user` / `tool` 返回值（`-100`） | [src/sft.py](src/sft.py) |
+| **SFT / LoRA + Merge** | ChatML + `<|tool_call|>` + `<think>` 格式，屏蔽非 assistant 损失；支持 LoRA 低秩微调与无损合并 | [src/sft.py](src/sft.py), [src/lora.py](src/lora.py) |
+| **DPO 偏好对齐** | 无需 Reward Model 的离线偏好对 `(chosen, rejected)` 优化 | [src/dpo.py](src/dpo.py) |
 | **MOPD 在线蒸馏** | 学生在线采样 + 按领域路由到数学/问答专家老师 + 全词表精确反向 KL + `--merge-init` 任务算术 | [src/distill.py](src/distill.py) |
 | **Dr. GRPO 强化学习** | 去掉 Critic、去掉 std 缩放、常数长度分母；内置 `agent` 工具调用、`instruct`、`choice` 及可选 RLAIF `--judge-url` | [src/rl_grpo.py](src/rl_grpo.py) |
 
@@ -71,17 +72,19 @@ src/
   model.py       # MiniLLM（mHC + Engram + 3:1 滑动窗口 GQA + MoE + DecodeState）
   muon.py        # Muon 优化器（Newton-Schulz 5 步正交化）
   utils.py       # Cosine / WSD 调度、Muon+AdamW 混合优化器、ChatML+Tool 编解码与存档
-  data_gen.py    # 预训练、通用/专家 SFT、MOPD 提示、多题型 RLVR 语料生成器
+  data_gen.py    # 预训练、通用/专家 SFT、DPO 偏好对、MOPD 提示、多题型 RLVR 语料生成器
+  lora.py        # LoRA 低秩旁路注入、增量保存与无损合并
   pretrain.py    # 预训练、混入对话退火、--cooldown-from WSD 分支退火、--overfit 自检
-  sft.py         # 通用 SFT 与领域专家 SFT（--out 自动识别 expert_<domain>）
+  sft.py         # 通用 SFT、领域专家 SFT 与 LoRA 微调（--lora-rank）
+  dpo.py         # DPO 离线偏好对齐（chosen vs rejected + ref_model）
   distill.py     # MOPD 多老师在线蒸馏（全词表反向 KL + --merge-init 任务算术）
   rl_grpo.py     # Dr. GRPO（Agent 多轮 calc 工具调用 + Instruct 约束 + Choice + 可选 RLAIF）
   eval.py        # 参数拆解、留出集损失、多题型得分与样本抽检
   generate.py    # 流式/批量 KV Cache 生成、Agent 多轮交互、开/关 KV Cache 测速对比
-  serve.py       # OpenAI 兼容 HTTP 服务（含 SSE 流式与 tool_calls）
-  web/chat.html  # 零外部依赖的本地聊天/续写网页
+  serve.py       # OpenAI 兼容 HTTP 服务（含 SSE 流式、tool_calls、enable_thinking 与 reasoning_content）
+  web/chat.html  # 零外部依赖的本地聊天/续写网页（支持思考过程展示）
 tests/
-  test_core.py   # 9 项核心等价性与数学性质单测
+  test_core.py   # 12 项核心等价性与数学性质单测
 docs/
   team_sharing.md # 写给 Agent 研发团队的 30 分钟内部分享讲稿
   interview_qa.md # 对照源码的 LLM 面试高频问题速查
@@ -121,12 +124,14 @@ python -m src.pretrain --preset nano --steps 200 --schedule wsd --optimizer muon
 # 3. 退火（--cooldown-from 继承 WSD 恒定段优化器状态分支退火，混入 10% 整段算损对话）
 python -m src.pretrain --cooldown-from out/pretrain/ckpt.pt --mix-chat data/sft.jsonl --steps 40
 
-# 4. 通用 SFT 与领域专家 SFT
+# 4. 通用 SFT、LoRA 微调与领域专家 SFT
 python -m src.sft --steps 250
+python -m src.sft --init out/sft/ckpt.pt --lora-rank 8 --steps 60 --out out/sft_lora/ckpt.pt
 python -m src.sft --data data/sft_expert_math.jsonl --steps 100
 python -m src.sft --data data/sft_expert_qa.jsonl --steps 100
 
-# 5. MOPD 多老师在线蒸馏（可选 --merge-init 先做任务算术融合）
+# 5. DPO 偏好对齐 & MOPD 多老师在线蒸馏
+python -m src.dpo --init out/sft/ckpt.pt --steps 40
 python -m src.distill --merge-init --steps 20
 
 # 6. Dr. GRPO 多题型强化学习（可加 --judge-url http://localhost:8080/v1 启用 RLAIF）
@@ -157,7 +162,7 @@ python -m src.serve out/rl/ckpt.pt --port 8001
 
 ## 单元测试与自检
 
-`pytest -v` 包含 9 项核心测试（[tests/test_core.py](tests/test_core.py)）：
+`pytest -v` 包含 12 项核心测试（[tests/test_core.py](tests/test_core.py)）：
 1. BPE 无损往返编码与普通文本防控制符注入隔离
 2. 防 Softmax 塌缩稳定交叉熵在高置信度（$m=25$）下梯度非零且全词表和为 0
 3. mHC `sinkhorn` 双随机矩阵行和与列和守恒
@@ -167,6 +172,9 @@ python -m src.serve out/rl/ckpt.pt --port 8001
 7. SFT Loss Mask 屏蔽 `user` / `tool` 返回及工具调用 JSON 解析
 8. MOPD 反向 KL 与 CA-MOPD 任务算术均值融合
 9. Muon Newton-Schulz 正交化、WSD 调度、多题型 RLVR 判分与 OpenAI 消息转换
+10. LoRA $B$ 全零初始化等价性与无损权重合并（merge 前后前向严格一致）
+11. DPO 偏好对损失单调性与隐式奖励准确率
+12. YaRN RoPE 外推缩放与 `<think>` 自适应思考开关解析
 
 ---
 
