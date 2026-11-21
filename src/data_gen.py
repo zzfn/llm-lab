@@ -73,13 +73,15 @@ INSTRUCT_SAMPLES = [
 def make_tool_task(rng: random.Random) -> tuple[str, str, int, list[dict]]:
     op = rng.choice(["+", "-", "*"])
     if op == "*":
-        a, b = rng.randint(11, 49), rng.randint(11, 49)
+        # 覆盖 0、个位数与两位数边界，避免 1 * 0 等 OOD 改数问题
+        a, b = rng.randint(0, 49), rng.randint(0, 49)
         ans = a * b
     elif op == "+":
-        a, b = rng.randint(100, 999), rng.randint(100, 999)
+        a, b = rng.randint(0, 999), rng.randint(0, 999)
         ans = a + b
     else:
-        a, b = rng.randint(200, 999), rng.randint(10, 199)
+        a = rng.randint(0, 999)
+        b = rng.randint(0, a)
         ans = a - b
     expr = f"{a} {op} {b}"
     prompt = f"请使用计算器计算 {expr}，并按 #### 答案 格式输出。"
