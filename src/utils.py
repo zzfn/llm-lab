@@ -1,4 +1,4 @@
-"""共用训练工具：设备选择、学习率调度（Cosine / WSD）、混合优化器、ChatML+Tool 模板与存档读写。"""
+"""共用训练工具：设备选择、学习率调度（Cosine / WSD）、混合优化器（Muon+AdamW）、ChatML+Tool 模板与存档读写。"""
 from __future__ import annotations
 
 import json
@@ -43,6 +43,10 @@ def lr_schedule(step: int, total_steps: int, warmup_steps: int, schedule: str = 
 
 
 def build_optimizers(model: MiniLLM, opt_name: str = "muon", lr_mult: float = 1.0) -> list[torch.optim.Optimizer]:
+    """构建优化器：
+    - adamw: 全模型按是否需要 weight_decay 分组用 AdamW
+    - muon: 线性投影/专家矩阵用 Muon；Embedding / Engram 记忆表 / Head / Norm / mHC 标量系数用 AdamW
+    """
     if opt_name == "adamw":
         decay, no_decay = [], []
         seen = set()
@@ -50,7 +54,7 @@ def build_optimizers(model: MiniLLM, opt_name: str = "muon", lr_mult: float = 1.
             if not p.requires_grad or p.data_ptr() in seen:
                 continue
             seen.add(p.data_ptr())
-            if p.ndim >= 2 and "embed" not in name and "head" not in name:
+            if p.ndim >= 2 and "embed" not in name and "head" not in name and "memory.table" not in name and "hyper." not in name:
                 decay.append(p)
             else:
                 no_decay.append(p)
@@ -64,7 +68,7 @@ def build_optimizers(model: MiniLLM, opt_name: str = "muon", lr_mult: float = 1.
         return opts
 
     if opt_name == "muon":
-        matrix_params, embed_params, head_params, norm_params = [], [], [], []
+        matrix_params, embed_params, engram_params, head_params, scalar_params = [], [], [], [], []
         seen = set()
         for name, p in model.named_parameters():
             if not p.requires_grad or p.data_ptr() in seen:
@@ -72,12 +76,14 @@ def build_optimizers(model: MiniLLM, opt_name: str = "muon", lr_mult: float = 1.
             seen.add(p.data_ptr())
             if "embed" in name:
                 embed_params.append(p)
-            elif "head" in name:
+            elif "memory.table" in name:
+                engram_params.append(p)
+            elif "head." in name:
                 head_params.append(p)
-            elif p.ndim == 2:
-                matrix_params.append(p)
+            elif "hyper." in name or name.endswith(".query") or p.ndim != 2:
+                scalar_params.append(p)
             else:
-                norm_params.append(p)
+                matrix_params.append(p)
 
         opts: list[torch.optim.Optimizer] = []
         if matrix_params:
@@ -85,10 +91,12 @@ def build_optimizers(model: MiniLLM, opt_name: str = "muon", lr_mult: float = 1.
         adam_groups = []
         if embed_params:
             adam_groups.append({"params": embed_params, "lr": 0.01 * lr_mult, "weight_decay": 0.0})
+        if engram_params:
+            adam_groups.append({"params": engram_params, "lr": 0.02 * lr_mult, "weight_decay": 0.0})
         if head_params:
             adam_groups.append({"params": head_params, "lr": 0.002 * lr_mult, "weight_decay": 0.0})
-        if norm_params:
-            adam_groups.append({"params": norm_params, "lr": 0.003 * lr_mult, "weight_decay": 0.0})
+        if scalar_params:
+            adam_groups.append({"params": scalar_params, "lr": 0.005 * lr_mult, "weight_decay": 0.0})
         if adam_groups:
             opts.append(torch.optim.AdamW(adam_groups, betas=(0.85, 0.95)))
         for opt in opts:
@@ -107,8 +115,13 @@ def set_lr_factor(optimizers: list[torch.optim.Optimizer], factor: float) -> Non
             g["lr"] = g["base_lr"] * factor
 
 
+def step_all(model: MiniLLM, optimizers: list[torch.optim.Optimizer]) -> None:
+    for opt in optimizers:
+        opt.step()
+    model.update_balance()
+
+
 def encode_message_body(tok: ByteBPETokenizer, msg: dict) -> list[int]:
-    """把单条消息的内容（含可选 tool_calls）编码成 token 序列。"""
     body = tok.encode_ordinary(msg.get("content", ""))
     for call in msg.get("tool_calls") or []:
         call_json = json.dumps(call, ensure_ascii=False)
@@ -120,29 +133,28 @@ def encode_message_body(tok: ByteBPETokenizer, msg: dict) -> list[int]:
 def format_chat_sft(
     tok: ByteBPETokenizer,
     messages: list[dict],
+    train_on: str = "assistant",
 ) -> tuple[list[int], list[int]]:
-    """把多轮对话（含 tool 角色与 tool_calls）编码成 (input_ids, loss_mask)。
-    只有 assistant 的回复内容、工具调用和其后的 <|im_end|> 的 mask 为 1；
-    system / user / tool 返回内容全为 0（不让模型去背工具输出）。
+    """把多轮对话编码成 (input_ids, loss_mask)。
+    - train_on="assistant": 仅 assistant 的正文、tool_calls 与 <|im_end|> mask=1；其余全为 0
+    - train_on="all": 整段均算损失（退火混入对话数据时使用）
     """
     ids: list[int] = []
     mask: list[int] = []
     nl = tok.encode_ordinary("\n")
+    everything = train_on == "all"
     for msg in messages:
         role = msg["role"]
         head = [tok.im_start_id] + tok.encode_ordinary(f"{role}\n")
         body = encode_message_body(tok, msg)
         tail = nl
         ids.extend(head + body + tail)
-        if role == "assistant":
-            mask.extend([0] * len(head) + [1] * len(body) + [0] * len(tail))
-        else:
-            mask.extend([0] * (len(head) + len(body) + len(tail)))
+        learn = everything or role == "assistant"
+        mask.extend([int(everything)] * len(head) + [int(learn)] * len(body) + [int(everything)] * len(tail))
     return ids, mask
 
 
 def format_chat_prompt(tok: ByteBPETokenizer, messages: list[dict]) -> list[int]:
-    """构造推理/RL 提示词前缀，以 `<|im_start|>assistant\n` 结尾。"""
     ids: list[int] = []
     nl = tok.encode_ordinary("\n")
     for msg in messages:
@@ -153,7 +165,6 @@ def format_chat_prompt(tok: ByteBPETokenizer, messages: list[dict]) -> list[int]
 
 
 def format_tool_turn(tok: ByteBPETokenizer, result_text: str) -> list[int]:
-    """工具执行结果拼成 tool 轮次，并接上下一轮 assistant 开头。"""
     nl = tok.encode_ordinary("\n")
     return (
         [tok.im_start_id]
@@ -167,7 +178,6 @@ def format_tool_turn(tok: ByteBPETokenizer, result_text: str) -> list[int]:
 
 
 def parse_tool_calls(tok: ByteBPETokenizer, resp_ids: list[int]) -> tuple[str, list[dict], list[str]]:
-    """解析一轮 assistant 生成的 token（到 <|im_end|> 为止），拆出 (正文, 合法工具调用, 损坏调用原文)。"""
     ids = list(resp_ids)
     if tok.im_end_id in ids:
         ids = ids[: ids.index(tok.im_end_id)]
@@ -197,19 +207,26 @@ def parse_tool_calls(tok: ByteBPETokenizer, resp_ids: list[int]) -> tuple[str, l
     return tok.decode(text_ids, skip_special=True), calls, broken
 
 
-def save_ckpt(path: str | Path, model: MiniLLM, step: int, stage: str, extra: dict | None = None) -> None:
+def save_ckpt(
+    path: str | Path,
+    model: MiniLLM,
+    step: int,
+    stage: str,
+    optimizers: list[torch.optim.Optimizer] | None = None,
+    extra: dict | None = None,
+) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(
-        {
-            "model": model.state_dict(),
-            "config": asdict(model.cfg),
-            "step": step,
-            "stage": stage,
-            "extra": extra or {},
-        },
-        path,
-    )
+    payload = {
+        "model": model.state_dict(),
+        "config": asdict(model.cfg),
+        "step": step,
+        "stage": stage,
+        "extra": extra or {},
+    }
+    if optimizers is not None:
+        payload["optimizers"] = [opt.state_dict() for opt in optimizers]
+    torch.save(payload, path)
 
 
 def load_ckpt(path: str | Path, device: torch.device) -> tuple[MiniLLM, dict]:

@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "llm-lab"
-version = "0.1.0"
-description = "Minimal, readable LLM from scratch (BPE, RoPE, GQA, KV Cache, Muon, WSD, SFT, Dr.GRPO) for learning and interview prep."
+version = "0.2.0"
+description = "麻雀虽小、五脏俱全的迷你大模型全栈实验仓：mHC + Engram + 3:1 GQA + MoE + 稳定交叉熵 + Muon + WSD + MOPD + Dr.GRPO + OpenAI 服务"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
@@ -17,6 +17,9 @@ dependencies = [
 dev = [
     "pytest>=8.0",
 ]
+
+[tool.setuptools.package-data]
+src = ["web/*.html"]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]

@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>llm-lab</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 14px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color: #1f2328; background: #f6f8fa; height: 100vh; display: flex; flex-direction: column; }
+  header { padding: 10px 16px; background: #fff; border-bottom: 1px solid #d0d7de; display: flex; justify-content: space-between; align-items: center; }
+  header .meta { font-size: 12px; color: #57606a; }
+  main { flex: 1; display: flex; min-height: 0; }
+  aside { width: 220px; background: #fff; border-right: 1px solid #d0d7de; padding: 12px; display: flex; flex-direction: column; gap: 10px; }
+  aside label { font-size: 12px; color: #57606a; display: flex; flex-direction: column; gap: 4px; }
+  aside input, aside select { padding: 6px; border: 1px solid #d0d7de; border-radius: 6px; }
+  section { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+  #log { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 12px; }
+  .msg { max-width: 78%; padding: 10px 14px; border-radius: 10px; white-space: pre-wrap; word-break: break-word; }
+  .user { align-self: flex-end; background: #0969da; color: #fff; }
+  .assistant { align-self: flex-start; background: #fff; border: 1px solid #d0d7de; }
+  form { display: flex; gap: 8px; padding: 12px 16px; background: #fff; border-top: 1px solid #d0d7de; }
+  textarea { flex: 1; resize: none; padding: 8px 10px; border: 1px solid #d0d7de; border-radius: 6px; font: inherit; }
+  button { padding: 8px 16px; border: 0; border-radius: 6px; background: #0969da; color: #fff; cursor: pointer; }
+  button.secondary { background: #eaeef2; color: #1f2328; }
+</style>
+</head>
+<body>
+<header>
+  <strong>llm-lab 本地演示</strong>
+  <span class="meta" id="info">加载中...</span>
+</header>
+<main>
+  <aside>
+    <label>模式
+      <select id="mode">
+        <option value="chat">对话 (Chat)</option>
+        <option value="complete">续写 (Completion)</option>
+      </select>
+    </label>
+    <label>温度 (Temperature)
+      <input id="temp" type="number" step="0.1" min="0" max="2" value="0.0">
+    </label>
+    <label>最大生成词数
+      <input id="maxTokens" type="number" min="8" max="512" value="96">
+    </label>
+    <button type="button" class="secondary" onclick="clearChat()">清空对话</button>
+  </aside>
+  <section>
+    <div id="log"></div>
+    <form id="form">
+      <textarea id="input" rows="2" placeholder="输入问题或开头（如：请使用计算器计算 27 * 34，并按 #### 答案 格式输出。）"></textarea>
+      <button type="submit" id="sendBtn">发送</button>
+    </form>
+  </section>
+</main>
+<script>
+const history = [];
+let controller = null;
+fetch("/v1/info").then(r => r.json()).then(d => {
+  document.getElementById("info").textContent = `阶段: ${d.stage} | 步数: ${d.step} | 参数: ${(d.params/1e6).toFixed(2)}M`;
+  document.getElementById("mode").value = d.default_mode || "chat";
+});
+function appendMsg(cls, text) {
+  const el = document.createElement("div");
+  el.className = "msg " + cls;
+  el.textContent = text;
+  document.getElementById("log").appendChild(el);
+  el.scrollIntoView({ behavior: "smooth" });
+  return el;
+}
+function clearChat() {
+  history.length = 0;
+  document.getElementById("log").innerHTML = "";
+}
+document.getElementById("form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  if (controller) { controller.abort(); controller = null; return; }
+  const text = document.getElementById("input").value.trim();
+  if (!text) return;
+  document.getElementById("input").value = "";
+  const mode = document.getElementById("mode").value;
+  const temp = parseFloat(document.getElementById("temp").value || "0");
+  const maxTokens = parseInt(document.getElementById("maxTokens").value || "96", 10);
+  appendMsg("user", text);
+  const outEl = appendMsg("assistant", "");
+  controller = new AbortController();
+  document.getElementById("sendBtn").textContent = "停止";
+  try {
+    if (mode === "complete") {
+      const r = await fetch("/v1/completions", {
+        method: "POST", headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({ prompt: text, temperature: temp, max_tokens: maxTokens }), signal: controller.signal
+      });
+      const d = await r.json();
+      outEl.textContent = d.choices[0].text;
+    } else {
+      history.push({ role: "user", content: text });
+      const r = await fetch("/v1/chat/completions", {
+        method: "POST", headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({ messages: history, temperature: temp, max_tokens: maxTokens, stream: true }), signal: controller.signal
+      });
+      const reader = r.body.getReader();
+      const dec = new TextDecoder();
+      let buf = "", full = "";
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buf += dec.decode(value, { stream: true });
+        for (const line of buf.split("\n\n")) {
+          if (!line.startsWith("data: ") || line === "data: [DONE]") continue;
+          const obj = JSON.parse(line.slice(6));
+          const delta = obj.choices[0].delta.content || "";
+          full += delta;
+          outEl.textContent = full;
+        }
+        buf = buf.endsWith("\n\n") ? "" : buf.slice(buf.lastIndexOf("\n\n") + 2);
+      }
+      history.push({ role: "assistant", content: full });
+    }
+  } finally {
+    controller = null;
+    document.getElementById("sendBtn").textContent = "发送";
+  }
+});
+</script>
+</body>
+</html>

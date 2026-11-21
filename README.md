@@ -1,30 +1,89 @@
 # llm-lab
 
-一个**极简、可白板推导、本机即可跑通全链路**的大语言模型学习与 Agent 原理分享仓库（灵感来自 `tinybrain` / `nanochat`）。
-
-不依赖 `transformers` / `trl` 等重型框架，从零手写全部核心模块，在 Apple Silicon（MPS）或单张消费级 GPU 上几分钟即可完整跑通：
-
-**Byte-level BPE 分词 → 从零预训练（WSD + Muon）→ 多轮 Tool-Calling SFT（Loss Mask）→ Agent Dr. GRPO 强化学习 → KV Cache 多轮工具调用推理**
+**麻雀虽小，五脏俱全。** 一个从零手写 PyTorch 的迷你中文大模型实验仓：模型参数控制在 **1.9M ~ 22.9M**（MacBook Apple Silicon 上几分钟即可跑通全部流程），但完整复现了现代大模型从 **分词 → 架构 → 预训练 → 退火 → SFT → 领域专家 → 多老师在线蒸馏 → 强化学习 → 评测 → OpenAI 服务与聊天网页** 的整条技术栈。
 
 ---
 
-## 目录结构
+## 目录
+
+- [模型总览与“五脏”特性](#模型总览与五脏特性)
+- [预设规格（词表 768）](#预设规格词表-768)
+- [代码结构](#代码结构)
+- [快速开始](#快速开始)
+- [完整跑一遍（10 个阶段一条龙）](#完整跑一遍10-个阶段一条龙)
+- [OpenAI 兼容服务与聊天网页](#openai-兼容服务与聊天网页)
+- [单元测试与自检](#单元测试与自检)
+- [分享与面试文档](#分享与面试文档)
+
+---
+
+## 模型总览与“五脏”特性
+
+```text
+token id ─┬─ Embedding ──────────────────────────┐
+          └─ Engram 查表 ─┬─ 2-gram (质数哈希×头) ┼─▶ StreamEntry (注意力选源)
+                          └─ 3-gram (质数哈希×头) ┘          │
+                                                             ▼
+                                                  4 条残差流 (B, T, 4, d)
+                                                             │
+       ┌──────────────── 第 i 层（重复 L 次）────────────────┐
+       │  [指定层] EngramGate 门控记忆注入                    │
+       │  pre_read → RMSNorm → 3:1滑动窗口GQA(RoPE/QK-Norm) → post_write + res(Sinkhorn) │
+       │  pre_read → RMSNorm → ReLU²/SwiGLU 或 MoE(共享+TopK) → post_write + res(Sinkhorn) │
+       └─────────────────────────────────────────────────────┘
+                                                             │
+                                                             ▼
+                                           StreamExit → RMSNorm → Head → 稳定交叉熵
+```
+
+| 模块 | 实现特性 | 对应源码 |
+|---|---|---|
+| **Byte-BPE 分词器** | 纯 Python 字节级 BPE（永不 `<unk>`），普通输入禁止解析 `<|im_start|>` / `<|tool_call|>` 防注入 | [src/tokenizer.py](src/tokenizer.py) |
+| **mHC 多流残差** | `n_streams=4`，注意力入口/出口，20 步对数域 Sinkhorn 约束流间混合矩阵为双随机矩阵 | [src/model.py](src/model.py) |
+| **Engram 查表记忆** | 2/3-gram 多头互异质数模长哈希查表，支持逐词生成的历史缓存与层间门控注入 | [src/model.py](src/model.py) |
+| **3:1 滑动窗口 GQA** | 每 4 层前 3 层只看最近 `window` 个词，第 4 层及末层看全文；含 QK-Norm、RoPE 与完整 KV Cache | [src/model.py](src/model.py) |
+| **MoE 混合专家** | `nano_moe` 预设：首层 Dense，其余层 `共享专家 + 8 选 2 路由专家`，无梯度偏置均衡 + 轻均衡损失 | [src/model.py](src/model.py) |
+| **防塌缩稳定交叉熵** | 按 `arXiv:2610.31642 v3` 实现 `m = -LSE(z_j - z_t)`, `softplus(-m)`，支持分块算损与饱和率监控 | [src/loss.py](src/loss.py) |
+| **Muon + WSD** | 二维矩阵使用 5 步 Newton-Schulz 正交化 `Muon`，其余参数用 `AdamW`；支持 WSD 分支退火 | [src/muon.py](src/muon.py), [src/pretrain.py](src/pretrain.py) |
+| **SFT & 领域专家** | ChatML + `<|tool_call|>` 格式，精确屏蔽 `system` / `user` / `tool` 返回值（`-100`） | [src/sft.py](src/sft.py) |
+| **MOPD 在线蒸馏** | 学生在线采样 + 按领域路由到数学/问答专家老师 + 全词表精确反向 KL + `--merge-init` 任务算术 | [src/distill.py](src/distill.py) |
+| **Dr. GRPO 强化学习** | 去掉 Critic、去掉 std 缩放、常数长度分母；内置 `agent` 工具调用、`instruct`、`choice` 及可选 RLAIF `--judge-url` | [src/rl_grpo.py](src/rl_grpo.py) |
+
+---
+
+## 预设规格（词表 768）
+
+| 预设 | 宽 × 层 | 总参数量 | 核心配置亮点 |
+|---|---|---:|---|
+| `pico` | 192 × 4 | **1.91M** | mHC(4流) + Engram + 3:1 滑动窗口(128)，1 分钟跑通全部 10 个阶段 |
+| `nano` | 384 × 6 | **8.95M** | mHC(4流) + Engram + 3:1 滑动窗口(256)，M5 本机主力实验档 |
+| `nano_moe` | 384 × 6 | **11.67M** | 在 `nano` 基础上第 1–5 层启用 `8 选 2` 路由专家 + 共享专家 |
+| `small` | 512 × 8 | **22.93M** | 更宽更深、双层 Engram 门控注入，适合单卡 GPU 或长时间实验 |
+
+---
+
+## 代码结构
 
 ```text
 src/
   tokenizer.py   # 纯 Python 字节级 BPE（含控制符防注入隔离）
-  model.py       # Decoder-Only Transformer（RMSNorm, RoPE, GQA, QK-Norm, SwiGLU/ReLU², KV Cache）
+  loss.py        # 防 Softmax 塌缩稳定交叉熵、分块线性交叉熵、饱和率监控
+  model.py       # MiniLLM（mHC + Engram + 3:1 滑动窗口 GQA + MoE + DecodeState）
   muon.py        # Muon 优化器（Newton-Schulz 5 步正交化）
-  utils.py       # Cosine / WSD 学习率调度、Muon+AdamW 混合优化器、ChatML+Tool 编码与解析
-  data_gen.py    # 零外部依赖的多轮工具调用语料与 RLVR 任务生成器
-  pretrain.py    # 阶段 1：Next-Token Prediction 预训练
-  sft.py         # 阶段 2：SFT 对话微调（屏蔽 user 与 tool 返回，只训 assistant 动作与 <|im_end|>）
-  rl_grpo.py     # 阶段 3：Agent 多轮工具调用 + Dr. GRPO 强化学习
-  generate.py    # 带 KV Cache 的自回归推理、Agent 多轮循环演示与 KV Cache 测速对比
+  utils.py       # Cosine / WSD 调度、Muon+AdamW 混合优化器、ChatML+Tool 编解码与存档
+  data_gen.py    # 预训练、通用/专家 SFT、MOPD 提示、多题型 RLVR 语料生成器
+  pretrain.py    # 预训练、混入对话退火、--cooldown-from WSD 分支退火、--overfit 自检
+  sft.py         # 通用 SFT 与领域专家 SFT（--out 自动识别 expert_<domain>）
+  distill.py     # MOPD 多老师在线蒸馏（全词表反向 KL + --merge-init 任务算术）
+  rl_grpo.py     # Dr. GRPO（Agent 多轮 calc 工具调用 + Instruct 约束 + Choice + 可选 RLAIF）
+  eval.py        # 参数拆解、留出集损失、多题型得分与样本抽检
+  generate.py    # 流式/批量 KV Cache 生成、Agent 多轮交互、开/关 KV Cache 测速对比
+  serve.py       # OpenAI 兼容 HTTP 服务（含 SSE 流式与 tool_calls）
+  web/chat.html  # 零外部依赖的本地聊天/续写网页
 tests/
-  test_core.py   # 分词防注入、RoPE 相对位置性质、KV Cache 等价性、SFT 掩码、工具解析等单测
+  test_core.py   # 9 项核心等价性与数学性质单测
 docs/
-  team_sharing.md # 写给 Agent 研发团队的 30 分钟内部分享讲稿与现场 Demo 指南
+  team_sharing.md # 写给 Agent 研发团队的 30 分钟内部分享讲稿
   interview_qa.md # 对照源码的 LLM 面试高频问题速查
 ```
 
@@ -32,43 +91,86 @@ docs/
 
 ## 快速开始
 
-### 1. 安装环境（推荐使用 `uv`）
+建议使用 `uv` 管理 Python 3.12 环境（自动适配 Apple MPS / NVIDIA CUDA / CPU）：
 
 ```bash
 uv venv --python 3.12
 source .venv/bin/activate
 uv pip install -e ".[dev]"
-```
 
-### 2. 运行单元测试（验证核心数学与工程等价性）
-
-```bash
+# 运行 9 项核心单元测试
 pytest -v
 ```
 
-### 3. 一条龙跑通 Agent 全流程
+---
+
+## 完整跑一遍（10 个阶段一条龙）
+
+以下命令在 Apple Silicon（M5 32GB MPS）上可直接顺序跑通：
 
 ```bash
-# 1. 生成多轮计算器工具调用语料并训练 768 词表的 Byte-BPE 分词器
+# 0. 生成多题型训练语料与 BPE 分词器
 python -m src.data_gen --out data --vocab-size 768
 
-# 2. 从零预训练（nano 10.03M 预设，WSD 调度 + Muon 优化器）
-python -m src.pretrain --preset nano --steps 200 --batch-size 16 --seq-len 128 --schedule wsd --optimizer muon
+# 1. 小批过拟合诊断（验证梯度与损失链路正常，40 步内 loss 可压到 < 0.01）
+python -m src.pretrain --preset nano --overfit --steps 40
 
-# 3. 监督微调（学会 <|tool_call|> 格式与 <|im_end|> 停止符，屏蔽 tool 返回损失）
-python -m src.sft --init out/pretrain/ckpt.pt --steps 250 --lr-mult 0.2
+# 2. 预训练（可用 --preset nano 或 --preset nano_moe）
+python -m src.pretrain --preset nano --steps 200 --schedule wsd --optimizer muon
 
-# 4. Agent Dr. GRPO 强化学习（多轮执行 calc 工具并按最终答案与格式打分）
-python -m src.rl_grpo --init out/sft/ckpt.pt --steps 25
+# 3. 退火（--cooldown-from 继承 WSD 恒定段优化器状态分支退火，混入 10% 整段算损对话）
+python -m src.pretrain --cooldown-from out/pretrain/ckpt.pt --mix-chat data/sft.jsonl --steps 40
 
-# 5. 多轮工具调用推理演示 & KV Cache 加速对比
+# 4. 通用 SFT 与领域专家 SFT
+python -m src.sft --steps 250
+python -m src.sft --data data/sft_expert_math.jsonl --steps 100
+python -m src.sft --data data/sft_expert_qa.jsonl --steps 100
+
+# 5. MOPD 多老师在线蒸馏（可选 --merge-init 先做任务算术融合）
+python -m src.distill --merge-init --steps 20
+
+# 6. Dr. GRPO 多题型强化学习（可加 --judge-url http://localhost:8080/v1 启用 RLAIF）
+python -m src.rl_grpo --steps 25
+
+# 7. 统一评测、多轮 Agent 演示 & KV Cache 测速对比
+python -m src.eval out/rl/ckpt.pt
 python -m src.generate --ckpt out/rl/ckpt.pt --mode agent
 python -m src.generate --ckpt out/rl/ckpt.pt --mode bench-cache
 ```
 
 ---
 
-## 推荐阅读
+## OpenAI 兼容服务与聊天网页
 
-- 团队技术分享讲稿（面向 Agent 研发）：[docs/team_sharing.md](docs/team_sharing.md)
-- 面试原理逐题对照：[docs/interview_qa.md](docs/interview_qa.md)
+```bash
+python -m src.serve out/rl/ckpt.pt --port 8001
+# 浏览器打开 http://127.0.0.1:8001/
+```
+
+提供接口：
+- `GET /`：离线聊天 / 续写双模式网页（不依赖外部 CDN）
+- `GET /v1/models`、`GET /v1/info`：查看当前加载阶段、步数与参数量
+- `POST /v1/chat/completions`：支持 `"stream": true` SSE 流式推送与 `tools` / `tool_calls`
+- `POST /v1/completions`：基座续写
+
+---
+
+## 单元测试与自检
+
+`pytest -v` 包含 9 项核心测试（[tests/test_core.py](tests/test_core.py)）：
+1. BPE 无损往返编码与普通文本防控制符注入隔离
+2. 防 Softmax 塌缩稳定交叉熵在高置信度（$m=25$）下梯度非零且全词表和为 0
+3. mHC `sinkhorn` 双随机矩阵行和与列和守恒
+4. RoPE 旋转位置编码的相对位置内积不变性
+5. **同时开启 mHC + Engram + 3:1 滑动窗口 + MoE 时，带 `DecodeState` 逐词解码与全量前向严格等价**
+6. MoE `balance_bias` 仅在优化器步后更新（不干扰激活重计算）
+7. SFT Loss Mask 屏蔽 `user` / `tool` 返回及工具调用 JSON 解析
+8. MOPD 反向 KL 与 CA-MOPD 任务算术均值融合
+9. Muon Newton-Schulz 正交化、WSD 调度、多题型 RLVR 判分与 OpenAI 消息转换
+
+---
+
+## 分享与面试文档
+
+- 写给 Agent 研发团队的内部分享讲稿：[docs/team_sharing.md](docs/team_sharing.md)
+- 对照源码的 LLM 面试原理速查：[docs/interview_qa.md](docs/interview_qa.md)

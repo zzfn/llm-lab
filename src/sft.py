@@ -1,4 +1,4 @@
-"""阶段 2：监督微调（SFT）—— 仅对 assistant 回复部分计算交叉熵损失。"""
+"""阶段 2：监督微调（SFT）—— 通用 SFT 与领域专家 SFT 共用，仅对 assistant 回复计算损失。"""
 from __future__ import annotations
 
 import argparse
@@ -9,23 +9,21 @@ from pathlib import Path
 import torch
 
 from .tokenizer import ByteBPETokenizer
-from .utils import build_optimizers, format_chat_sft, load_ckpt, lr_schedule, pick_device, save_ckpt, set_lr_factor
+from .utils import build_optimizers, format_chat_sft, load_ckpt, lr_schedule, pick_device, save_ckpt, set_lr_factor, step_all
 
 
 def load_sft_examples(
     jsonl_path: Path, tok: ByteBPETokenizer, max_len: int
 ) -> list[tuple[torch.Tensor, torch.Tensor]]:
-    """读取对话数据并构建 (x, y)，其中非 assistant 位置以及 padding 的 y 设为 -100。"""
     examples: list[tuple[torch.Tensor, torch.Tensor]] = []
     for line in jsonl_path.read_text(encoding="utf-8").splitlines():
         if not line.strip():
             continue
         row = json.loads(line)
-        ids, mask = format_chat_sft(tok, row["messages"])
+        ids, mask = format_chat_sft(tok, row["messages"], train_on="assistant")
         if len(ids) < 4 or len(ids) > max_len + 1:
             continue
         x = torch.tensor(ids[:-1], dtype=torch.long)
-        # 预测下一 token：若下一个位置 mask==0，则 target 设为 -100（忽略损失）
         y = torch.tensor(
             [tok_id if m == 1 else -100 for tok_id, m in zip(ids[1:], mask[1:])],
             dtype=torch.long,
@@ -54,18 +52,25 @@ def train(args) -> dict:
     torch.manual_seed(args.seed)
     device = pick_device(args.device)
     tok = ByteBPETokenizer.load(args.tokenizer)
-    model, _ = load_ckpt(args.init, device)
+    init_path = args.init or ("out/anneal/ckpt.pt" if Path("out/anneal/ckpt.pt").exists() else "out/pretrain/ckpt.pt")
+    model, _ = load_ckpt(init_path, device)
     examples = load_sft_examples(Path(args.data), tok, max_len=model.cfg.max_seq_len)
 
     rng.shuffle(examples)
     split = max(1, int(len(examples) * 0.9))
     train_ex, val_ex = examples[:split], examples[split:] or examples[:16]
 
+    out_path = args.out
+    if not out_path:
+        stem = Path(args.data).stem
+        out_path = f"out/{stem.removeprefix('sft_')}/ckpt.pt" if stem.startswith("sft_expert_") else "out/sft/ckpt.pt"
+
     optimizers = build_optimizers(model, opt_name=args.optimizer, lr_mult=args.lr_mult)
-    print(f"[SFT] device={device} train={len(train_ex)} val={len(val_ex)} steps={args.steps}")
+    print(f"[SFT] init={init_path} data={args.data} train={len(train_ex)} val={len(val_ex)} steps={args.steps} -> {out_path}")
 
     model.train()
     last_val = float("nan")
+    loss = torch.tensor(0.0)
     for step in range(args.steps):
         factor = lr_schedule(step, args.steps, warmup_steps=max(1, args.steps // 10), schedule="cosine", min_lr_frac=0.05)
         set_lr_factor(optimizers, factor)
@@ -74,37 +79,36 @@ def train(args) -> dict:
 
         for opt in optimizers:
             opt.zero_grad(set_to_none=True)
-        _, loss = model(x, y)
+        _, loss = model(x, y, return_logits=False)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        for opt in optimizers:
-            opt.step()
+        step_all(model, optimizers)
 
         if (step + 1) % args.log_every == 0 or step + 1 == args.steps:
             model.eval()
             with torch.no_grad():
                 vx, vy = collate_sft(val_ex[: min(32, len(val_ex))], tok.pad_id, device)
-                _, vloss = model(vx, vy)
+                _, vloss = model(vx, vy, return_logits=False)
                 last_val = vloss.item()
             model.train()
             print(f"step {step+1:>4}/{args.steps} | train_loss {loss.item():.4f} | val_loss {last_val:.4f}")
 
-    save_ckpt(args.out, model, args.steps, stage="sft", extra={"val_loss": last_val})
-    print(f"SFT 完成，权重已保存至 {args.out}")
-    return {"train_loss": loss.item(), "val_loss": last_val}
+    save_ckpt(out_path, model, args.steps, stage="sft", extra={"val_loss": last_val})
+    print(f"SFT 完成，权重已保存至 {out_path}")
+    return {"train_loss": loss.item(), "val_loss": last_val, "out": out_path}
 
 
 def main():
-    p = argparse.ArgumentParser(description="SFT 对话微调")
-    p.add_argument("--init", default="out/pretrain/ckpt.pt")
+    p = argparse.ArgumentParser(description="通用 SFT 与领域专家 SFT")
+    p.add_argument("--init", default="", help="起始权重；默认优先用 out/anneal/ckpt.pt，其次 out/pretrain/ckpt.pt")
     p.add_argument("--data", default="data/sft.jsonl")
     p.add_argument("--tokenizer", default="data/tokenizer.json")
-    p.add_argument("--out", default="out/sft/ckpt.pt")
+    p.add_argument("--out", default="", help="输出路径；专家数据默认写到 out/expert_<domain>/ckpt.pt")
     p.add_argument("--optimizer", default="muon", choices=["muon", "adamw"])
-    p.add_argument("--lr-mult", type=float, default=0.1)
-    p.add_argument("--steps", type=int, default=120)
+    p.add_argument("--lr-mult", type=float, default=0.2)
+    p.add_argument("--steps", type=int, default=200)
     p.add_argument("--batch-size", type=int, default=16)
-    p.add_argument("--log-every", type=int, default=20)
+    p.add_argument("--log-every", type=int, default=50)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--device", default="auto")
     train(p.parse_args())
