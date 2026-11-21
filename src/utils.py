@@ -1,6 +1,7 @@
-"""共用训练工具：设备选择、学习率调度（Cosine / WSD）、混合优化器、ChatML 模板与存档读写。"""
+"""共用训练工具：设备选择、学习率调度（Cosine / WSD）、混合优化器、ChatML+Tool 模板与存档读写。"""
 from __future__ import annotations
 
+import json
 import math
 from dataclasses import asdict
 from pathlib import Path
@@ -24,10 +25,7 @@ def pick_device(name: str = "auto") -> torch.device:
 
 def lr_schedule(step: int, total_steps: int, warmup_steps: int, schedule: str = "wsd",
                 decay_frac: float = 0.2, min_lr_frac: float = 0.1) -> float:
-    """返回当前步的学习率倍率（0..1）。
-    - cosine: 线性预热 + 余弦衰减到 min_lr_frac
-    - wsd: 线性预热 + 恒定高原期 + 最后 decay_frac 比例按 1 - sqrt(p) 退火到 min_lr_frac
-    """
+    """返回当前步的学习率倍率（0..1）。"""
     if step < warmup_steps:
         return (step + 1) / max(1, warmup_steps)
     if schedule == "cosine":
@@ -45,10 +43,6 @@ def lr_schedule(step: int, total_steps: int, warmup_steps: int, schedule: str = 
 
 
 def build_optimizers(model: MiniLLM, opt_name: str = "muon", lr_mult: float = 1.0) -> list[torch.optim.Optimizer]:
-    """构建优化器：
-    - adamw: 全模型按是否需要 weight_decay 分两组用 AdamW
-    - muon: 隐藏层 2D 矩阵用 Muon；Embedding / Head / Norm 等用 AdamW
-    """
     if opt_name == "adamw":
         decay, no_decay = [], []
         seen = set()
@@ -64,7 +58,10 @@ def build_optimizers(model: MiniLLM, opt_name: str = "muon", lr_mult: float = 1.
             {"params": decay, "lr": 3e-4 * lr_mult, "weight_decay": 0.01},
             {"params": no_decay, "lr": 3e-4 * lr_mult, "weight_decay": 0.0},
         ]
-        return [torch.optim.AdamW([g for g in groups if g["params"]], betas=(0.9, 0.95))]
+        opts = [torch.optim.AdamW([g for g in groups if g["params"]], betas=(0.9, 0.95))]
+        for g in opts[0].param_groups:
+            g["base_lr"] = g["lr"]
+        return opts
 
     if opt_name == "muon":
         matrix_params, embed_params, head_params, norm_params = [], [], [], []
@@ -110,21 +107,31 @@ def set_lr_factor(optimizers: list[torch.optim.Optimizer], factor: float) -> Non
             g["lr"] = g["base_lr"] * factor
 
 
+def encode_message_body(tok: ByteBPETokenizer, msg: dict) -> list[int]:
+    """把单条消息的内容（含可选 tool_calls）编码成 token 序列。"""
+    body = tok.encode_ordinary(msg.get("content", ""))
+    for call in msg.get("tool_calls") or []:
+        call_json = json.dumps(call, ensure_ascii=False)
+        body.extend([tok.tool_call_id] + tok.encode_ordinary(call_json) + [tok.tool_call_end_id])
+    body.append(tok.im_end_id)
+    return body
+
+
 def format_chat_sft(
     tok: ByteBPETokenizer,
-    messages: list[dict[str, str]],
+    messages: list[dict],
 ) -> tuple[list[int], list[int]]:
-    """把多轮对话编码成 (input_ids, loss_mask)。
-    只有 assistant 的回复内容和其后的 <|im_end|> 的 mask 为 1，其余全为 0。
+    """把多轮对话（含 tool 角色与 tool_calls）编码成 (input_ids, loss_mask)。
+    只有 assistant 的回复内容、工具调用和其后的 <|im_end|> 的 mask 为 1；
+    system / user / tool 返回内容全为 0（不让模型去背工具输出）。
     """
     ids: list[int] = []
     mask: list[int] = []
     nl = tok.encode_ordinary("\n")
     for msg in messages:
         role = msg["role"]
-        content = msg["content"]
         head = [tok.im_start_id] + tok.encode_ordinary(f"{role}\n")
-        body = tok.encode_ordinary(content) + [tok.im_end_id]
+        body = encode_message_body(tok, msg)
         tail = nl
         ids.extend(head + body + tail)
         if role == "assistant":
@@ -134,15 +141,60 @@ def format_chat_sft(
     return ids, mask
 
 
-def format_chat_prompt(tok: ByteBPETokenizer, messages: list[dict[str, str]]) -> list[int]:
+def format_chat_prompt(tok: ByteBPETokenizer, messages: list[dict]) -> list[int]:
     """构造推理/RL 提示词前缀，以 `<|im_start|>assistant\n` 结尾。"""
     ids: list[int] = []
     nl = tok.encode_ordinary("\n")
     for msg in messages:
         ids.extend([tok.im_start_id] + tok.encode_ordinary(f"{msg['role']}\n"))
-        ids.extend(tok.encode_ordinary(msg["content"]) + [tok.im_end_id] + nl)
+        ids.extend(encode_message_body(tok, msg) + nl)
     ids.extend([tok.im_start_id] + tok.encode_ordinary("assistant\n"))
     return ids
+
+
+def format_tool_turn(tok: ByteBPETokenizer, result_text: str) -> list[int]:
+    """工具执行结果拼成 tool 轮次，并接上下一轮 assistant 开头。"""
+    nl = tok.encode_ordinary("\n")
+    return (
+        [tok.im_start_id]
+        + tok.encode_ordinary("tool\n")
+        + tok.encode_ordinary(result_text)
+        + [tok.im_end_id]
+        + nl
+        + [tok.im_start_id]
+        + tok.encode_ordinary("assistant\n")
+    )
+
+
+def parse_tool_calls(tok: ByteBPETokenizer, resp_ids: list[int]) -> tuple[str, list[dict], list[str]]:
+    """解析一轮 assistant 生成的 token（到 <|im_end|> 为止），拆出 (正文, 合法工具调用, 损坏调用原文)。"""
+    ids = list(resp_ids)
+    if tok.im_end_id in ids:
+        ids = ids[: ids.index(tok.im_end_id)]
+    text_ids: list[int] = []
+    calls: list[dict] = []
+    broken: list[str] = []
+    i = 0
+    while i < len(ids):
+        if ids[i] == tok.tool_call_id:
+            if tok.tool_call_end_id in ids[i + 1 :]:
+                j = ids.index(tok.tool_call_end_id, i + 1)
+                raw = tok.decode(ids[i + 1 : j], skip_special=True)
+                try:
+                    obj = json.loads(raw)
+                    if not isinstance(obj, dict) or not isinstance(obj.get("name"), str):
+                        raise ValueError
+                    calls.append({"name": obj["name"], "arguments": obj.get("arguments") or {}})
+                except ValueError:
+                    broken.append(raw)
+                i = j + 1
+            else:
+                broken.append(tok.decode(ids[i + 1 :], skip_special=True))
+                break
+        else:
+            text_ids.append(ids[i])
+            i += 1
+    return tok.decode(text_ids, skip_special=True), calls, broken
 
 
 def save_ckpt(path: str | Path, model: MiniLLM, step: int, stage: str, extra: dict | None = None) -> None:

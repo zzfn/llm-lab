@@ -1,10 +1,10 @@
 """极简字节级 BPE 分词器（纯 Python 实现，约 130 行）。
 
-核心原理（面试高频）：
+核心原理（Agent 研发视角）：
 1. 把文本转成 UTF-8 字节序列（0..255），天然做到 byte-fallback，永不出现 <unk>。
 2. 训练阶段：统计相邻 token 对的出现频率，反复把最高频的 pair 合并成新 token，直到达到目标词表大小。
-3. 编码阶段：先按正则/空白粗切或直接按字节切分，再按训练学到的 merge 优先级贪心合并。
-4. 特殊控制符（如 <|im_start|>、<|im_end|>）不参与普通文本切分，直接映射为固定高 ID，避免注入歧义。
+3. 特殊控制符（<|im_start|>、<|im_end|>、<|tool_call|>、<|/tool_call|>）不参与普通文本切分，
+   用户输入/工具返回强制走 allow_special=False，从底层防止“提示词控制符注入”。
 """
 from __future__ import annotations
 
@@ -12,7 +12,15 @@ import json
 from collections import Counter
 from pathlib import Path
 
-SPECIAL_TOKENS = ["<|pad|>", "<|bos|>", "<|eos|>", "<|im_start|>", "<|im_end|>"]
+SPECIAL_TOKENS = [
+    "<|pad|>",
+    "<|bos|>",
+    "<|eos|>",
+    "<|im_start|>",
+    "<|im_end|>",
+    "<|tool_call|>",
+    "<|/tool_call|>",
+]
 
 
 def _get_stats(ids_list: list[list[int]]) -> Counter[tuple[int, int]]:
@@ -73,6 +81,14 @@ class ByteBPETokenizer:
     def im_end_id(self) -> int:
         return self.special_to_id["<|im_end|>"]
 
+    @property
+    def tool_call_id(self) -> int:
+        return self.special_to_id["<|tool_call|>"]
+
+    @property
+    def tool_call_end_id(self) -> int:
+        return self.special_to_id["<|/tool_call|>"]
+
     @classmethod
     def train(cls, texts: list[str], vocab_size: int = 512) -> "ByteBPETokenizer":
         """在给定语料上训练 BPE merge 表。"""
@@ -80,7 +96,6 @@ class ByteBPETokenizer:
         if vocab_size < min_size:
             raise ValueError(f"vocab_size 至少需要 {min_size}，收到 {vocab_size}")
         num_merges = vocab_size - min_size
-        # 按行/段转为 UTF-8 字节 ID 列表
         chunks = [list(t.encode("utf-8")) for t in texts if t]
         merges: dict[tuple[int, int], int] = {}
         for i in range(num_merges):
@@ -96,11 +111,10 @@ class ByteBPETokenizer:
         return cls(merges=merges)
 
     def encode_ordinary(self, text: str) -> list[int]:
-        """编码普通文本（不解析特殊控制符，防止提示词注入）。"""
+        """编码普通文本（不解析特殊控制符，防止用户/工具返回内容伪造控制符）。"""
         ids = list(text.encode("utf-8"))
         while len(ids) >= 2:
             stats = _get_stats([ids])
-            # 按 merge 学到的先后顺序（new_id 越小优先级越高）合并
             pair = min(stats, key=lambda p: self.merges.get(p, float("inf")))
             if pair not in self.merges:
                 break
@@ -110,7 +124,6 @@ class ByteBPETokenizer:
     def encode(self, text: str, allow_special: bool = False) -> list[int]:
         if not allow_special:
             return self.encode_ordinary(text)
-        # 简单扫描特殊 token
         out: list[int] = []
         i = 0
         while i < len(text):
