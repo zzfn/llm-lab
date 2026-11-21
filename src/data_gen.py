@@ -130,6 +130,20 @@ def build_datasets(out_dir: Path, vocab_size: int = 768, seed: int = 42) -> None
         expert_math.append(row)
         general_sft.append(row)
 
+    # 补充 2~3 轮普通多轮对话（不依赖 tool 轮次，对齐网页端多轮 history 分布）
+    single_turns = (
+        [({"role": "user", "content": q}, {"role": "assistant", "content": a}) for q, a in QA_PAIRS]
+        + [({"role": "user", "content": prompt}, {"role": "assistant", "content": ans_text}) for prompt, _, ans_text in INSTRUCT_SAMPLES]
+        + [({"role": "user", "content": f"请直接回答选项字母：\n{q}"}, {"role": "assistant", "content": f"答案：{letter}"}) for q, letter in CHOICES]
+    )
+    for _ in range(500):
+        k_turns = rng.choice([2, 3])
+        picked = rng.sample(single_turns, k=k_turns)
+        msgs = []
+        for u_msg, a_msg in picked:
+            msgs.extend([u_msg, a_msg])
+        general_sft.append({"messages": msgs})
+
     rng.shuffle(general_sft)
     rng.shuffle(expert_math)
     rng.shuffle(expert_qa)
