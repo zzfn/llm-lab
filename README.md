@@ -180,5 +180,7 @@ python -m src.serve out/rl/ckpt.pt --port 8001
 
 ## 分享与面试文档
 
+- **交互式 HTML 原理图解（代码 × 动画对照，推荐）**：[docs/visual_guide.html](docs/visual_guide.html)（也可在 `python -m src.serve` 启动后访问 `/guide`）
 - 写给 Agent 研发团队的内部分享讲稿：[docs/team_sharing.md](docs/team_sharing.md)
+- 飞书学习与踩坑复盘记录：[docs/feishu_learning_log.md](docs/feishu_learning_log.md)
 - 对照源码的 LLM 面试原理速查：[docs/interview_qa.md](docs/interview_qa.md)

@@ -25,6 +25,7 @@ from .tokenizer import ByteBPETokenizer
 from .utils import SYSTEM_PROMPT, format_chat_prompt, format_tool_turn, load_ckpt, parse_tool_calls, pick_device, split_thinking
 
 PAGE = Path(__file__).parent / "web" / "chat.html"
+GUIDE_PAGE = Path(__file__).resolve().parent.parent / "docs" / "visual_guide.html"
 BASE_STAGES = ("pretrain", "anneal")
 
 
@@ -227,6 +228,13 @@ def make_handler(svc: Service):
         def do_GET(self):
             if self.path in ("/", "/index.html"):
                 html = PAGE.read_bytes()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(html)))
+                self.end_headers()
+                self.wfile.write(html)
+            elif self.path == "/guide" and GUIDE_PAGE.exists():
+                html = GUIDE_PAGE.read_bytes()
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.send_header("Content-Length", str(len(html)))
