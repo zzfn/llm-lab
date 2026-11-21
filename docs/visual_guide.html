@@ -75,8 +75,9 @@
   <button class="active" data-tab="t1">1. 分词与防注入</button>
   <button data-tab="t2">2. 模型五脏架构图</button>
   <button data-tab="t3">3. KV Cache 加速真相</button>
-  <button data-tab="t4">4. 训练全流程 & Loss Mask</button>
-  <button data-tab="t5">5. 实战 6 大踩坑复盘</button>
+  <button data-tab="t4">4. 训练语料 &amp; 数据蒸馏</button>
+  <button data-tab="t5">5. 训练全流程 &amp; Loss Mask</button>
+  <button data-tab="t6">6. 实战 6 大踩坑复盘</button>
 </nav>
 
 <main>
@@ -209,8 +210,49 @@ cache.k, cache.v = k[:, :, keep], v[:, :, keep]  <span class="cm"># 滑动窗口
     </div>
   </section>
 
-  <!-- TAB 4: Training & Loss Mask -->
+  <!-- TAB 4: Corpus & Distillation -->
   <section id="t4" class="tab">
+    <div class="grid">
+      <div class="card">
+        <h2>点击切换：四个阶段的训练语料到底长啥样？</h2>
+        <p class="muted">一句话理解：<strong>预训练 = 通读万卷书（纯文本）</strong>，<strong>后训练 SFT = 抄优质回答日志</strong>，<strong>DPO = 好日志 vs 坏日志</strong>，<strong>GRPO = 只给题和裁判</strong>。</p>
+        <div class="row-flex" id="corpusBtns">
+          <button class="btn" onclick="renderCorpus('pretrain')">① Pretrain 语料</button>
+          <button class="btn sec" onclick="renderCorpus('sft')">② SFT 成功日志</button>
+          <button class="btn sec" onclick="renderCorpus('dpo')">③ DPO 好坏对比</button>
+          <button class="btn sec" onclick="renderCorpus('grpo')">④ GRPO 试错题</button>
+        </div>
+        <div id="corpusDetail" style="margin-top:14px;"></div>
+
+        <h3 style="margin-top:18px;">两种“模型蒸馏”别搞混</h3>
+        <ul style="padding-left:18px;margin:6px 0;" class="muted">
+          <li><strong>黑盒数据蒸馏（<code>src/fetch_hf.py</code>，最实用）</strong>：拿更强模型（如 DeepSeek-R1、Qwen-72B）生成的 <code>&lt;think&gt;</code> + 完美回答当 <code>sft.jsonl</code> 喂给小模型；不需要同词表，立竿见影。</li>
+          <li><strong>白盒在线蒸馏（<code>src/distill.py</code> MOPD）</strong>：学生自己生成回答，老师交出整个词表的概率分布（Logits）算反向 KL；要求老师与学生必须共用同一套词表。</li>
+        </ul>
+      </div>
+
+      <div class="card">
+        <h2>对应源码：<code>src/fetch_hf.py</code> &amp; <code>src/data_gen.py</code></h2>
+        <span class="pill blue">Agent 数据飞轮</span><span class="pill green">HuggingFace 抽样</span>
+        <pre><span class="cm"># src/fetch_hf.py: 从 HuggingFace 拉取轻量中文后训练语料（含 R1 &lt;think&gt;）</span>
+<span class="cm"># 1) opencsg/smoltalk-chinese (中文多轮对话)</span>
+<span class="cm"># 2) m-a-p/COIG-CQIA (精选问答 / 脑筋急转弯)</span>
+<span class="cm"># 3) Congliu/Chinese-DeepSeek-R1-Distill-data-110k (带 reasoning_content)</span>
+<span class="kw">for</span> row <span class="kw">in</span> fetch_rows(<span class="st">"Congliu/Chinese-DeepSeek-R1-Distill-data-110k"</span>, ...):
+    asst = {<span class="st">"role"</span>: <span class="st">"assistant"</span>, <span class="st">"content"</span>: row[<span class="st">"content"</span>]}
+    <span class="kw">if</span> row.get(<span class="st">"reasoning_content"</span>):
+        asst[<span class="st">"thinking"</span>] = row[<span class="st">"reasoning_content"</span>]  <span class="cm"># 映射进 &lt;think&gt;...&lt;/think&gt;</span>
+
+<span class="cm"># 实操避坑：飞书/线上 Agent 日志怎么变成高质量飞轮数据？</span>
+<span class="cm">#   SFT  = 过滤掉工具报错与废话重试，只留干净成功轨迹</span>
+<span class="cm">#   DPO  = 用户点赞轨迹 (chosen) vs 用户点踩/报错轨迹 (rejected)</span>
+<span class="cm">#   GRPO = 用户原问题 + 沙箱自动判分（不需要现成答案日志）</span></pre>
+      </div>
+    </div>
+  </section>
+
+  <!-- TAB 5: Training & Loss Mask -->
+  <section id="t5" class="tab">
     <div class="grid">
       <div class="card">
         <h2>核心机制：不同训练阶段，哪些词要算 Loss（算梯度）？</h2>
@@ -222,14 +264,6 @@ cache.k, cache.v = k[:, :, keep], v[:, :, keep]  <span class="cm"># 滑动窗口
         </div>
         <div id="maskTokens" class="tok-wrap" style="margin-top:14px;"></div>
         <p id="maskExplain" class="muted" style="margin-top:12px;"></p>
-
-        <h3 style="margin-top:18px;">三阶段语料长啥样？（Agent 数据飞轮视角）</h3>
-        <ul style="padding-left:18px;margin:6px 0;" class="muted">
-          <li><strong>Pretrain 语料（通读万卷书）</strong>：纯网页/百科/代码/书籍文本，无问答格式；训完只会“接着往下编（续写）”，不知道停。</li>
-          <li><strong>SFT 语料（洗干净的成功日志）</strong>：筛选后的优质回答或强模型生成的蒸馏日志（<code>src/fetch_hf.py</code>），<strong>不能把工具报错脏轨迹喂进去</strong>。</li>
-          <li><strong>DPO 语料（好日志 vs 坏日志）</strong>：用户点赞/采纳轨迹作 <code>chosen</code>，点踩/报错轨迹作 <code>rejected</code>。</li>
-          <li><strong>GRPO 语料（只给题目和裁判）</strong>：不依赖现成日志，模型在工具沙箱里自己探索并按结果拿奖惩。</li>
-        </ul>
 
         <h3 style="margin-top:14px;">五大后训练手段各自干嘛？</h3>
         <ul style="padding-left:18px;margin:6px 0;" class="muted">
@@ -261,8 +295,8 @@ pg_loss = -(adv[:, <span class="kw">None</span>] * target_lp * mask[:, <span cla
     </div>
   </section>
 
-  <!-- TAB 5: Pitfalls -->
-  <section id="t5" class="tab">
+  <!-- TAB 6: Pitfalls -->
+  <section id="t6" class="tab">
     <div class="card">
       <h2>今晚亲手跑模型踩出的 6 个真实大坑（团队分享最抓人部分）</h2>
       <div class="pitfall red">
@@ -477,6 +511,47 @@ function renderMask(mode) {
   document.getElementById("maskExplain").textContent = exp[mode];
 }
 renderMask("sft");
+
+// Tab 4: Corpus explorer
+const CORPUS_DATA = {
+  pretrain: {
+    pill: ["blue", "data/pretrain.txt · 无问答格式纯文本"],
+    title: "Pretrain 预训练语料 = 人读的一切公开文章/书籍/代码",
+    why: "目标：学语言规律、世界常识、代码与数学表达。缺点：模型只学会了“接着往下编（续写）”，问它问题不知道回答也不懂得停止。",
+    sample: "Transformer 使用自注意力机制建模序列依赖关系，通过 Query、Key 和 Value 之间的点积计算上下文权重。\n旋转位置编码 RoPE 通过对向量的相邻维度施加二维旋转...\n# 真实大模型（如 tinybrain）会从网页、维基百科、论文、代码、古籍洗出 60B token"
+  },
+  sft: {
+    pill: ["green", "data/sft_mixed.jsonl · 清洗后的优质问答/工具日志"],
+    title: "SFT 后训练语料 = 精选的成功对话 & 大模型蒸馏日志",
+    why: "目标：把“读过万卷书的书呆子”变成“听话的助手”。注意：线上 Agent 日志必须先洗掉工具报错与无效重试，只留干净成功轨迹！",
+    sample: '{\n  "messages": [\n    {"role": "system", "content": "你是 llm-lab 助手，必要时调用 calc(expr)。"},\n    {"role": "user", "content": "请使用计算器计算 38 * 24"},\n    {"role": "assistant", "content": "我先调用计算器算一下。", "tool_calls": [{"name": "calc", "arguments": {"expr": "38 * 24"}}]},\n    {"role": "tool", "content": "912"},\n    {"role": "assistant", "content": "计算结果是 912。\\n#### 912"}\n  ]\n}'
+  },
+  dpo: {
+    pill: ["amber", "data/dpo.jsonl · 成对好坏轨迹对比"],
+    title: "DPO 偏好语料 = 用户点赞 (chosen) vs 点踩/幻觉 (rejected)",
+    why: "目标：让模型分清什么是“负责任地调工具”，什么是“偷懒胡猜”。非常适合直接复用线上用户点赞/重新生成日志！",
+    sample: '{\n  "chosen":  [..., {"role": "assistant", "tool_calls": [{"name": "calc", ...}]}, {"role": "tool", "content": "912"}, {"role": "assistant", "content": "#### 912"}],\n  "rejected": [..., {"role": "assistant", "content": "直接猜一下结果是 922。"}]\n}'
+  },
+  grpo: {
+    pill: ["purple", "data/rl_tasks.jsonl · 只有题目和裁判，不需标准过程"],
+    title: "GRPO 强化学习语料 = 题目 + 自动化判分器",
+    why: "目标：不抄老师日志，自己进沙箱多轮试错（对则加分、JSON 损坏扣分），把“会背格式”真正练成“高准确率决策”。",
+    sample: '{\n  "reward": "agent",\n  "messages": [{"role": "system", ...}, {"role": "user", "content": "请使用计算器计算 454 + 520，并按 #### 答案 格式输出。"}],\n  "answer": "974",\n  "split": "eval"\n}'
+  }
+};
+function renderCorpus(kind) {
+  const keys = ["pretrain", "sft", "dpo", "grpo"];
+  document.querySelectorAll("#corpusBtns button").forEach((b, i) => {
+    b.className = keys[i] === kind ? "btn" : "btn sec";
+  });
+  const d = CORPUS_DATA[kind];
+  document.getElementById("corpusDetail").innerHTML =
+    `<span class="pill ${d.pill[0]}">${d.pill[1]}</span>` +
+    `<h3 style="margin-top:8px;">${d.title}</h3>` +
+    `<p class="muted">${d.why}</p>` +
+    `<pre style="white-space:pre-wrap;">${d.sample.replace(/</g, "&lt;")}</pre>`;
+}
+renderCorpus("pretrain");
 </script>
 </body>
 </html>
