@@ -20,8 +20,9 @@ from pathlib import Path
 import torch
 
 from .generate import stream_ids
+from .rl_grpo import execute_tool
 from .tokenizer import ByteBPETokenizer
-from .utils import format_chat_prompt, load_ckpt, parse_tool_calls, pick_device, split_thinking
+from .utils import format_chat_prompt, format_tool_turn, load_ckpt, parse_tool_calls, pick_device, split_thinking
 
 PAGE = Path(__file__).parent / "web" / "chat.html"
 BASE_STAGES = ("pretrain", "anneal")
@@ -170,6 +171,34 @@ class Service:
             "choices": [{"index": 0, "text": text, "finish_reason": "stop" if finished else "length"}],
         }
 
+    def agent_run(self, body: dict) -> dict:
+        prompt = body.get("prompt", "")
+        max_tokens = int(body.get("max_tokens", 96))
+        temperature = float(body.get("temperature", 0.0))
+        top_k = int(body.get("top_k", 40))
+        messages = [
+            {"role": "system", "content": "你可以使用工具 calc(expr) 计算算术表达式。"},
+            {"role": "user", "content": prompt},
+        ]
+        ids = format_chat_prompt(self.tok, messages)
+        turns: list[dict] = []
+        with self.lock:
+            for _ in range(3):
+                gen = self._run_tokens(ids, max_tokens, temperature, top_k, self.tok.im_end_id)
+                ids.extend(gen)
+                text, calls, broken = parse_tool_calls(self.tok, gen)
+                _, content = split_thinking(text)
+                turn: dict = {"assistant": content, "calls": calls, "broken": broken, "tool_result": ""}
+                if calls:
+                    res = "\n".join(execute_tool(c["name"], c["arguments"]) for c in calls)
+                    turn["tool_result"] = res
+                    turns.append(turn)
+                    ids.extend(format_tool_turn(self.tok, res))
+                else:
+                    turns.append(turn)
+                    break
+        return {"turns": turns, "final": turns[-1]["assistant"] if turns else ""}
+
 
 def make_handler(svc: Service):
     class Handler(BaseHTTPRequestHandler):
@@ -227,6 +256,8 @@ def make_handler(svc: Service):
                     self._json(200, svc.chat(body))
             elif self.path == "/v1/completions":
                 self._json(200, svc.complete(body))
+            elif self.path == "/v1/agent":
+                self._json(200, svc.agent_run(body))
             else:
                 self._json(404, {"error": f"not found: {self.path}"})
 
