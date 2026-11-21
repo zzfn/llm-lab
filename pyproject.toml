@@ -17,6 +17,9 @@ dependencies = [
 dev = [
     "pytest>=8.0",
 ]
+mlx = [
+    "mlx-lm>=0.30",
+]
 
 [tool.setuptools.package-data]
 src = ["web/*.html"]

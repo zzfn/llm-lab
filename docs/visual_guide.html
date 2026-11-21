@@ -78,6 +78,7 @@
   <button data-tab="t5">4. 训练全流程 &amp; Loss Mask</button>
   <button data-tab="t3">5. KV Cache 加速真相</button>
   <button data-tab="t6">6. 实战 6 大踩坑复盘</button>
+  <button data-tab="t7">7. Qwen3.5-0.8B 实战 &amp; 黑盒蒸馏</button>
 </nav>
 
 <main>
@@ -325,6 +326,122 @@ pg_loss = -(adv[:, <span class="kw">None</span>] * target_lp * mask[:, <span cla
       </div>
     </div>
   </section>
+
+  <!-- TAB 7: Qwen3.5-0.8B MLX LoRA & Black-box Teacher Distillation -->
+  <section id="t7" class="tab">
+    <div class="card">
+      <h2>从零自研 (8.95M) vs 开源基座 Qwen3.5-0.8B-4bit + 教师黑盒蒸馏实验记录</h2>
+      <p class="muted">本页完整记录在 Apple M5 (32GB) 上使用 <code>mlx-lm==0.32.2</code> 对 <code>mlx-community/Qwen3.5-0.8B-MLX-4bit</code>（总参 752.39M / 8 层 LoRA 仅训 <strong>1.804M = 0.240%</strong>）做多轮对比实验的真实日志、Loss 曲线与排坑全过程。</p>
+      <div class="row-flex" style="margin-bottom:10px;">
+        <span class="pill blue">Apple M5 32GB 统一内存</span>
+        <span class="pill green">4-bit QLoRA 仅训 0.240% 参数</span>
+        <span class="pill purple">大模型教师黑盒蒸馏 + calc 验算</span>
+        <span class="pill amber">4 道保留题严格防泄露</span>
+      </div>
+      <div style="overflow-x:auto;">
+        <table style="width:100%;border-collapse:collapse;font-size:13px;">
+          <thead>
+            <tr style="background:var(--bg);text-align:left;border-bottom:2px solid var(--border);">
+              <th style="padding:8px;">实验组别</th>
+              <th style="padding:8px;">数据与超参</th>
+              <th style="padding:8px;">Loss 轨迹</th>
+              <th style="padding:8px;">Q1: <code>1 * 0</code> (####)</th>
+              <th style="padding:8px;">Q2: 中文 <code>38*24</code></th>
+              <th style="padding:8px;">Q3: <code>KV Cache</code> (禁调工具)</th>
+              <th style="padding:8px;">Q4: <code>四季更替</code> (常识)</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr style="border-bottom:1px solid var(--border);">
+              <td style="padding:8px;"><strong>Base 未微调</strong><br><span class="muted">Qwen3.5-0.8B-4bit</span></td>
+              <td style="padding:8px;">零微调对照</td>
+              <td style="padding:8px;">—</td>
+              <td style="padding:8px;"><span class="pill amber">格式反</span> 输出 <code>0 ####</code> (0.73s)</td>
+              <td style="padding:8px;"><span class="pill green">正确</span> <code>912</code> (0.68s)</td>
+              <td style="padding:8px;"><span class="pill red">幻觉+误调</span> 说成算嵌入向量且调 <code>calc("38 * 24")</code></td>
+              <td style="padding:8px;"><span class="pill amber">漏关键因</span> 未提“地轴倾斜” (1.79s)</td>
+            </tr>
+            <tr style="border-bottom:1px solid var(--border);">
+              <td style="padding:8px;"><strong>组 A：首版崩坏</strong><br><span class="muted">自拼模板 + 高 lr</span></td>
+              <td style="padding:8px;"><code>sft_mixed</code> (含80x重复)<br><code>lr=1e-4</code>, 120步, 3.61M</td>
+              <td style="padding:8px;">val <code>3.158→1.235→1.361</code><br>train 降至 <code>0.446</code></td>
+              <td colspan="4" style="padding:8px;"><span class="pill red">灾难性遗忘/坍塌</span> 模板不匹配 + 超长截断 EOS + 高学习率过拟合，输出退化为 <code>! ! ！ ！</code> 与“先回忆核心定义再作答”复读。</td>
+            </tr>
+            <tr style="border-bottom:1px solid var(--border);">
+              <td style="padding:8px;"><strong>组 B：对齐模板</strong><br><span class="muted">旧合成模板去重</span></td>
+              <td style="padding:8px;"><code>sft_mixed</code> 去重 (<code>1063</code>)<br>XML+<code>tools</code>, <code>lr=2e-5</code>, 80步</td>
+              <td style="padding:8px;">val <code>2.321→1.765→2.201</code><br>40步后过拟合反弹</td>
+              <td style="padding:8px;"><span class="pill green">修复</span> <code>#### 0</code> (0.96s)</td>
+              <td style="padding:8px;"><span class="pill green">正确</span> <code>912</code> (0.70s)</td>
+              <td style="padding:8px;"><span class="pill red">思考死循环</span> 记住了缓存键值，但卡在想调 <code>calc</code> 复读</td>
+              <td style="padding:8px;"><span class="pill red">思考死循环</span> 反复自我否定，未退出 <code>&lt;/think&gt;</code></td>
+            </tr>
+            <tr style="border-bottom:1px solid var(--border);">
+              <td style="padding:8px;"><strong>组 C：教师蒸馏 v1</strong><br><span class="muted">有 Schema 示例 bias</span></td>
+              <td style="padding:8px;"><code>qa=32 + calc=72</code><br><code>lr=2e-5</code>, 50步</td>
+              <td style="padding:8px;">val <code>2.241→0.855→0.803</code><br>train <code>0.958</code></td>
+              <td style="padding:8px;"><span class="pill green">正确</span> <code>#### 0</code> (0.79s)</td>
+              <td style="padding:8px;"><span class="pill green">正确</span> <code>912</code> (0.78s)</td>
+              <td style="padding:8px;"><span class="pill red">Schema 泄漏</span> 抄系统描述示例调 <code>calc("38 * 24")</code></td>
+              <td style="padding:8px;"><span class="pill amber">不循环但缺Tilt</span> 0.28s 秒回，未提地轴倾斜</td>
+            </tr>
+            <tr style="background:#f6ffed;">
+              <td style="padding:8px;"><strong>组 D：教师黑盒蒸馏定稿</strong><br><span class="muted">去示例 bias + 1:1 均衡</span></td>
+              <td style="padding:8px;"><code>qa=32 + calc=47</code> (<code>train=52</code>)<br>多样思考, <code>lr=2e-5</code>, 45步</td>
+              <td style="padding:8px;">val <code>2.751→1.701→1.632</code><br>train <code>0.998</code> · <code>29 tok/s</code></td>
+              <td style="padding:8px;"><span class="pill green">全对</span> <code>#### 0</code> (0.95s)</td>
+              <td style="padding:8px;"><span class="pill green">全对</span> <code>912</code> (0.76s)</td>
+              <td style="padding:8px;"><span class="pill green">零误触发</span> 0.56s 直接作答 KV Cache，不调 <code>calc</code></td>
+              <td style="padding:8px;"><span class="pill green">科学精准</span> 点出<strong>地轴倾斜</strong>与公转 (0.31s)</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="grid">
+      <div class="card">
+        <h2>逐题真实输出对照（点击切换 4 道保留评测题）</h2>
+        <div class="row-flex" id="qwenEvalBtns">
+          <button class="btn" onclick="renderQwenEval(0)">Q1: 1 * 0 (格式)</button>
+          <button class="btn sec" onclick="renderQwenEval(1)">Q2: 三十八×二十四</button>
+          <button class="btn sec" onclick="renderQwenEval(2)">Q3: KV Cache</button>
+          <button class="btn sec" onclick="renderQwenEval(3)">Q4: 地球四季更替</button>
+        </div>
+        <div id="qwenEvalDetail" style="margin-top:12px;"></div>
+      </div>
+
+      <div class="card">
+        <h2>Qwen 实战新踩出的 5 个关键工程坑（坑 7 ~ 坑 11）</h2>
+        <div class="pitfall red">
+          <strong>坑 7：Apple M5 上 <code>kIOGPUCommandBufferCallbackErrorOutOfMemory</code></strong><br>
+          <span class="muted">默认 <code>batch_size=4, max_seq=2048</code> 会撑爆 Metal 单次命令缓冲。改为 <code>batch-size=1, grad-accumulation-steps=4, max-seq-length=640, --grad-checkpoint</code> 后稳定训练。</span>
+        </div>
+        <div class="pitfall red">
+          <strong>坑 8：套错模板 + 重复样本 + 截断 EOS = 崩坏成 <code>! ! ！</code></strong><br>
+          <span class="muted">自拼 <code>&lt;|tool_call|&gt;</code> 会和 Qwen3.5 原生 XML <code>&lt;tool_call&gt;&lt;function=calc&gt;</code> 冲突；同时超过截断长度会切掉 <code>&lt;|im_end|&gt;</code> 教模型“别停”；合成问答重复 80 遍叠加 <code>lr=1e-4</code> 直接破坏基座语言分布。</span>
+        </div>
+        <div class="pitfall">
+          <strong>坑 9：对齐模板但缺“免工具思考示范”，非数学题仍会陷入 <code>&lt;think&gt;</code> 死循环</strong><br>
+          <span class="muted">组 B 把 <code>&lt;think&gt;</code> 对齐给数学题后，Q1/Q2 立竿见影，但 Q3/Q4 因为没见过“遇到概念题先在脑中判断不调工具然后 <code>&lt;/think&gt;</code>”，在贪心解码下一直循环。</span>
+        </div>
+        <div class="pitfall red">
+          <strong>坑 10：Tool Schema 描述里的示例（<code>"如 38 * 24"</code>）诱发“恐慌抄示例”</strong><br>
+          <span class="muted">Base 和组 C 在被问 <code>KV Cache</code> 时竟双双调用 <code>calc("38 * 24")</code>——根源正是系统提示词的 <code>parameters.expr.description</code> 里写了示例 <code>"如 38 * 24"</code>！去掉具体数字示例 + 保持 1:1 工具/问答配比后彻底根治。</span>
+        </div>
+        <div class="pitfall">
+          <strong>坑 11：高质量黑盒蒸馏解锁了基座“原本会但答不出”的隐性知识</strong><br>
+          <span class="muted"><code>TEACHER_QA</code> 故意不含“四季更替”防泄露，但组 D 仅用 45 步就把回答从“公转和自转相互作用”纠偏到“<strong>地轴倾斜与公转轨道的相互作用</strong>”（0.31s），证明 LoRA 的核心价值在于校准决策与思考退出习惯，释放基座原有知识。</span>
+        </div>
+        <pre><span class="cm"># 复现本页全部 MLX 实验与黑盒蒸馏</span>
+pip install -e <span class="st">".[mlx]"</span>
+python -m examples.build_teacher_distill --n-calc <span class="num">50</span>
+python -m examples.run_qwen_mlx \
+  --src-data data/sft_teacher.jsonl --mlx-data data/mlx_teacher \
+  --adapter-path out/qwen35_teacher_lora --iters <span class="num">45</span> --lr <span class="num">2e-5</span></pre>
+      </div>
+    </div>
+  </section>
 </main>
 
 <script>
@@ -552,6 +669,47 @@ function renderCorpus(kind) {
     `<pre style="white-space:pre-wrap;">${d.sample.replace(/</g, "&lt;")}</pre>`;
 }
 renderCorpus("pretrain");
+
+// Tab 7: Qwen3.5-0.8B 4-way comparison viewer
+const QWEN_EVAL_DATA = [
+  {
+    q: "Q1：请使用计算器计算 1 * 0，并按 #### 答案 格式输出。",
+    base: "[0.73s] 先在 <think> 中分析，再调用 calc(\"1 * 0\") -> [Tool 返回 0]\n最终输出：0 ####   ❌（要求 #### 0，顺序写反）",
+    old: "[0.96s] <think> 精简为先调用 calc，调用 calc(\"1 * 0\") -> [Tool 返回 0]\n最终输出：调用成功，返回是 0。\n#### 0   ✅（格式被 SFT 纠偏）",
+    teacher: "[0.95s] <think> 为了避免心算出错，调用 calc 工具。\n调用 calc(\"1 * 0\") -> [Tool 返回 0]\n最终输出：计算结果是 0。\n#### 0   ✅（思维简洁、调用精准、格式完全正确）"
+  },
+  {
+    q: "Q2：帮我算一下三十八乘以二十四等于多少？",
+    base: "[0.68s] 中文数词能识别出 38 * 24 并调用 calc(\"38 * 24\") -> [Tool 返回 912]\n最终输出：38 * 24 = 912   ✅",
+    old: "[0.70s] <think> 极简为“先调用 calc 算一下。” -> calc(\"38 * 24\") -> 912\n最终输出：38乘以24等于 912。   ✅",
+    teacher: "[0.76s] 完整识别口语乘式 -> calc(\"38 * 24\") -> [Tool 返回 912]\n最终输出：38 * 24 的计算结果是 912。   ✅"
+  },
+  {
+    q: "Q3：什么是 KV Cache？为什么 Agent 多轮对话越往后越慢？（严格保留题，未入训练集）",
+    base: "[3.30s] ❌ 概念幻觉 + 误调工具：\n误称 KV Cache 是“计算嵌入向量”，并受 Schema 描述示例诱导调用 calc(\"38 * 24\")；后续 1~4 点无限重复直至 max_tokens 截断。",
+    old: "[2.78s] ⚠️ 概念修对但死循环：\n在 <think> 中正确说出“缓存历史键值张量”，但随后卡在“我应该调用 calc 算一下 KV Cache = H × H^T”反复循环直到截断。",
+    teacher: "[0.56s] ✅ 零误触发、直接响应：\n<think> 概念清晰，无需调用 calc，直接回答用户问题。\n输出：KV Cache 是生成式人工智能中用于存储和检索上下文信息的关键机制...允许模型复用前文已处理内容降低重复计算开销。\n（注：未展开多轮变慢的带宽细节，反映 0.8B 保留题泛化尚有继续加高阶问答蒸馏的空间）"
+  },
+  {
+    q: "Q4：用一句话解释为什么地球会有四季更替？（严格保留题，未入训练集）",
+    base: "[1.79s] ⚠️ 未准确点出关键机制：\n输出“地球四季更替的根本原因是地球公转和自转的相互作用...”，表述啰嗦且重点偏移。",
+    old: "[2.81s] ❌ 思考死循环：\n在 <think> 里不断重复“地球公转使得地球在不同时间经过不同的纬度...”，始终未能输出 </think>。",
+    teacher: "[0.31s] ✅ 又快又准（解锁基座隐性知识）：\n<think> 地理常识题，无需调用 calc，直接回答用户问题即可。\n输出：地球有四季更替的根本原因是地轴倾斜与公转轨道的相互作用。"
+  }
+];
+function renderQwenEval(idx) {
+  document.querySelectorAll("#qwenEvalBtns button").forEach((b, i) => {
+    b.className = i === idx ? "btn" : "btn sec";
+  });
+  const d = QWEN_EVAL_DATA[idx];
+  const esc = s => s.replace(/</g, "&lt;");
+  document.getElementById("qwenEvalDetail").innerHTML =
+    `<h3>${d.q}</h3>` +
+    `<div style="margin-top:8px;"><span class="pill amber">1. Base 未微调</span><pre style="white-space:pre-wrap;">${esc(d.base)}</pre></div>` +
+    `<div style="margin-top:10px;"><span class="pill blue">2. 旧模板 LoRA (组 B: lr=2e-5)</span><pre style="white-space:pre-wrap;">${esc(d.old)}</pre></div>` +
+    `<div style="margin-top:10px;"><span class="pill green">3. 教师黑盒蒸馏 LoRA (组 D: 45步定稿)</span><pre style="white-space:pre-wrap;">${esc(d.teacher)}</pre></div>`;
+}
+renderQwenEval(2);
 </script>
 </body>
 </html>
