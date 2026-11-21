@@ -12,6 +12,8 @@ from .model import MiniLLM, ModelConfig
 from .muon import Muon
 from .tokenizer import ByteBPETokenizer
 
+SYSTEM_PROMPT = "你是 llm-lab 助手，必要时调用 calc(expr)。"
+
 
 def pick_device(name: str = "auto") -> torch.device:
     if name != "auto":

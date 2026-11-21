@@ -15,6 +15,7 @@ import random
 from pathlib import Path
 
 from .tokenizer import ByteBPETokenizer
+from .utils import SYSTEM_PROMPT
 
 PRETRAIN_TEMPLATES = [
     "Transformer 使用自注意力机制建模序列依赖关系，通过 Query、Key 和 Value 之间的点积计算上下文权重。",
@@ -83,7 +84,7 @@ def make_tool_task(rng: random.Random) -> tuple[str, str, int, list[dict]]:
     expr = f"{a} {op} {b}"
     prompt = f"请使用计算器计算 {expr}，并按 #### 答案 格式输出。"
     msgs = [
-        {"role": "system", "content": "你可以使用工具 calc(expr) 计算算术表达式。"},
+        {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": prompt},
         {"role": "assistant", "content": "我先调用计算器算一下。", "tool_calls": [{"name": "calc", "arguments": {"expr": expr}}]},
         {"role": "tool", "content": str(ans)},
@@ -111,37 +112,40 @@ def build_datasets(out_dir: Path, vocab_size: int = 768, seed: int = 42) -> None
     rng.shuffle(pretrain_lines)
     (out_dir / "pretrain.txt").write_text("\n".join(pretrain_lines), encoding="utf-8")
 
-    # 2. 通用 SFT + 领域专家 SFT
+    # 2. 通用 SFT + 领域专家 SFT（全部统一使用同一段 SYSTEM_PROMPT，由模型自己决定直接回答还是调工具）
     expert_math, expert_qa, general_sft = [], [], []
+    sys_msg = {"role": "system", "content": SYSTEM_PROMPT}
     for _ in range(80):
         for q, a in QA_PAIRS:
-            row = {"messages": [{"role": "user", "content": q}, {"role": "assistant", "thinking": f"先回忆核心定义再作答：{q[:12]}", "content": a}]}
+            row = {"messages": [sys_msg, {"role": "user", "content": q}, {"role": "assistant", "thinking": f"先回忆核心定义再作答：{q[:12]}", "content": a}]}
             expert_qa.append(row)
             general_sft.append(row)
     for prompt, _, ans_text in INSTRUCT_SAMPLES:
         for _ in range(40):
-            general_sft.append({"messages": [{"role": "user", "content": prompt}, {"role": "assistant", "content": ans_text}]})
+            general_sft.append({"messages": [sys_msg, {"role": "user", "content": prompt}, {"role": "assistant", "content": ans_text}]})
     for q, letter in CHOICES:
         for _ in range(40):
-            general_sft.append({"messages": [{"role": "user", "content": f"请直接回答选项字母：\n{q}"}, {"role": "assistant", "content": f"答案：{letter}"}]})
+            general_sft.append({"messages": [sys_msg, {"role": "user", "content": f"请直接回答选项字母：\n{q}"}, {"role": "assistant", "content": f"答案：{letter}"}]})
     for _ in range(600):
         _, _, _, msgs = make_tool_task(rng)
         row = {"messages": msgs}
         expert_math.append(row)
         general_sft.append(row)
 
-    # 补充 2~3 轮普通多轮对话（不依赖 tool 轮次，对齐网页端多轮 history 分布）
+    # 补充 2 轮混合多轮对话（含普通 QA + 工具调用混合，统一挂在 SYSTEM_PROMPT 下）
     single_turns = (
-        [({"role": "user", "content": q}, {"role": "assistant", "content": a}) for q, a in QA_PAIRS]
-        + [({"role": "user", "content": prompt}, {"role": "assistant", "content": ans_text}) for prompt, _, ans_text in INSTRUCT_SAMPLES]
-        + [({"role": "user", "content": f"请直接回答选项字母：\n{q}"}, {"role": "assistant", "content": f"答案：{letter}"}) for q, letter in CHOICES]
+        [[{"role": "user", "content": q}, {"role": "assistant", "content": a}] for q, a in QA_PAIRS]
+        + [[{"role": "user", "content": prompt}, {"role": "assistant", "content": ans_text}] for prompt, _, ans_text in INSTRUCT_SAMPLES]
+        + [[{"role": "user", "content": f"请直接回答选项字母：\n{q}"}, {"role": "assistant", "content": f"答案：{letter}"}] for q, letter in CHOICES]
     )
     for _ in range(500):
-        k_turns = rng.choice([2, 3])
-        picked = rng.sample(single_turns, k=k_turns)
-        msgs = []
-        for u_msg, a_msg in picked:
-            msgs.extend([u_msg, a_msg])
+        msgs = [sys_msg]
+        for turn_msgs in rng.sample(single_turns, k=2):
+            msgs.extend(turn_msgs)
+        if rng.random() < 0.4:
+            _, _, _, tool_msgs = make_tool_task(rng)
+            # 接在后面（去掉重复的 system 头）
+            msgs.extend(tool_msgs[1:])
         general_sft.append({"messages": msgs})
 
     rng.shuffle(general_sft)
@@ -157,11 +161,11 @@ def build_datasets(out_dir: Path, vocab_size: int = 768, seed: int = 42) -> None
         prompt, _, _, _ = make_tool_task(rng)
         mopd_prompts.append({
             "domain": "math",
-            "messages": [{"role": "system", "content": "你可以使用工具 calc(expr) 计算算术表达式。"}, {"role": "user", "content": prompt}],
+            "messages": [sys_msg, {"role": "user", "content": prompt}],
         })
     for q, _ in QA_PAIRS:
         for _ in range(10):
-            mopd_prompts.append({"domain": "qa", "messages": [{"role": "user", "content": q}]})
+            mopd_prompts.append({"domain": "qa", "messages": [sys_msg, {"role": "user", "content": q}]})
     rng.shuffle(mopd_prompts)
     _write_jsonl(out_dir / "mopd_prompts.jsonl", mopd_prompts)
 
@@ -175,21 +179,21 @@ def build_datasets(out_dir: Path, vocab_size: int = 768, seed: int = 42) -> None
         seen.add(expr)
         rl_rows.append({
             "reward": "agent",
-            "messages": [{"role": "system", "content": "你可以使用工具 calc(expr) 计算算术表达式。"}, {"role": "user", "content": prompt}],
+            "messages": [sys_msg, {"role": "user", "content": prompt}],
             "answer": str(ans),
             "split": "eval" if len(rl_rows) < 40 else "train",
         })
     for idx, (prompt, rules, _) in enumerate(INSTRUCT_SAMPLES * 10):
         rl_rows.append({
             "reward": "instruct",
-            "messages": [{"role": "user", "content": prompt}],
+            "messages": [sys_msg, {"role": "user", "content": prompt}],
             "rules": rules,
             "split": "eval" if idx < 6 else "train",
         })
     for idx, (q, letter) in enumerate(CHOICES * 6):
         rl_rows.append({
             "reward": "choice",
-            "messages": [{"role": "user", "content": f"请直接回答选项字母：\n{q}"}],
+            "messages": [sys_msg, {"role": "user", "content": f"请直接回答选项字母：\n{q}"}],
             "answer": letter,
             "split": "eval" if idx < 5 else "train",
         })
@@ -203,15 +207,15 @@ def build_datasets(out_dir: Path, vocab_size: int = 768, seed: int = 42) -> None
         dpo_rows.append({
             "chosen": msgs,
             "rejected": [
-                {"role": "system", "content": "你可以使用工具 calc(expr) 计算算术表达式。"},
+                sys_msg,
                 {"role": "user", "content": prompt},
                 {"role": "assistant", "content": f"直接猜一下结果是 {wrong_ans}。"},
             ],
         })
     for q, a in QA_PAIRS * 10:
         dpo_rows.append({
-            "chosen": [{"role": "user", "content": q}, {"role": "assistant", "thinking": "按核心原理回答。", "content": a}],
-            "rejected": [{"role": "user", "content": q}, {"role": "assistant", "content": "这个问题不太清楚，大概随便设置一下就行。"}],
+            "chosen": [sys_msg, {"role": "user", "content": q}, {"role": "assistant", "thinking": "按核心原理回答。", "content": a}],
+            "rejected": [sys_msg, {"role": "user", "content": q}, {"role": "assistant", "content": "这个问题不太清楚，大概随便设置一下就行。"}],
         })
     _write_jsonl(out_dir / "dpo.jsonl", dpo_rows)
 

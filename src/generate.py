@@ -154,10 +154,10 @@ def main():
 
     if args.mode == "agent":
         from .rl_grpo import execute_tool
-        from .utils import format_tool_turn, parse_tool_calls
+        from .utils import SYSTEM_PROMPT, format_tool_turn, parse_tool_calls
 
         messages = [
-            {"role": "system", "content": "你可以使用工具 calc(expr) 计算算术表达式。"},
+            {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": args.prompt},
         ]
         ids = format_chat_prompt(tok, messages)

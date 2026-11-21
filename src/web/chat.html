@@ -35,7 +35,6 @@
     <label>模式
       <select id="mode">
         <option value="chat">对话 (Chat)</option>
-        <option value="agent">Agent 工具 (calc)</option>
         <option value="complete">续写 (Completion)</option>
       </select>
     </label>
@@ -110,49 +109,29 @@ document.getElementById("form").addEventListener("submit", async (e) => {
       });
       const d = await r.json();
       bodyEl.textContent = d.choices[0].text;
-    } else if (mode === "agent") {
+    } else {
+      history.push({ role: "user", content: text });
       const r = await fetch("/v1/agent", {
         method: "POST", headers: {"Content-Type": "application/json"},
-        body: JSON.stringify({ prompt: text, temperature: temp, max_tokens: maxTokens }), signal: controller.signal
+        body: JSON.stringify({ messages: history, temperature: temp, max_tokens: maxTokens, enable_thinking: enableThinking }), signal: controller.signal
       });
       const d = await r.json();
+      if (d.reasoning_content) {
+        thinkEl.style.display = "block";
+        thinkEl.textContent = "思考：" + d.reasoning_content;
+      }
+      const turns = d.turns || [];
       const lines = [];
-      (d.turns || []).forEach((t, idx) => {
-        lines.push(`[Turn ${idx + 1}] ${t.assistant}`);
+      turns.forEach((t, idx) => {
         if (t.calls && t.calls.length) {
-          lines.push(`🔧 调用工具: ${JSON.stringify(t.calls)} -> 返回: ${t.tool_result}`);
+          lines.push(t.assistant);
+          lines.push(`🔧 调用工具 ${JSON.stringify(t.calls)} → ${t.tool_result}`);
+        } else {
+          lines.push(t.assistant);
         }
       });
       bodyEl.textContent = lines.join("\n");
-    } else {
-      history.push({ role: "user", content: text });
-      const r = await fetch("/v1/chat/completions", {
-        method: "POST", headers: {"Content-Type": "application/json"},
-        body: JSON.stringify({ messages: history, temperature: temp, max_tokens: maxTokens, enable_thinking: enableThinking, stream: true }), signal: controller.signal
-      });
-      const reader = r.body.getReader();
-      const dec = new TextDecoder();
-      let buf = "", full = "", fullThink = "";
-      while (true) {
-        const { value, done } = await reader.read();
-        if (done) break;
-        buf += dec.decode(value, { stream: true });
-        for (const line of buf.split("\n\n")) {
-          if (!line.startsWith("data: ") || line === "data: [DONE]") continue;
-          const deltaObj = JSON.parse(line.slice(6)).choices[0].delta;
-          if (deltaObj.reasoning_content) {
-            fullThink += deltaObj.reasoning_content;
-            thinkEl.style.display = "block";
-            thinkEl.textContent = "思考：" + fullThink;
-          }
-          if (deltaObj.content) {
-            full += deltaObj.content;
-            bodyEl.textContent = full;
-          }
-        }
-        buf = buf.endsWith("\n\n") ? "" : buf.slice(buf.lastIndexOf("\n\n") + 2);
-      }
-      history.push({ role: "assistant", content: full });
+      history.push({ role: "assistant", content: d.final || "" });
     }
   } finally {
     controller = null;

@@ -22,7 +22,7 @@ import torch
 from .generate import stream_ids
 from .rl_grpo import execute_tool
 from .tokenizer import ByteBPETokenizer
-from .utils import format_chat_prompt, format_tool_turn, load_ckpt, parse_tool_calls, pick_device, split_thinking
+from .utils import SYSTEM_PROMPT, format_chat_prompt, format_tool_turn, load_ckpt, parse_tool_calls, pick_device, split_thinking
 
 PAGE = Path(__file__).parent / "web" / "chat.html"
 BASE_STAGES = ("pretrain", "anneal")
@@ -172,22 +172,29 @@ class Service:
         }
 
     def agent_run(self, body: dict) -> dict:
-        prompt = body.get("prompt", "")
-        max_tokens = int(body.get("max_tokens", 96))
+        max_tokens = int(body.get("max_tokens", 128))
         temperature = float(body.get("temperature", 0.0))
         top_k = int(body.get("top_k", 40))
-        messages = [
-            {"role": "system", "content": "你可以使用工具 calc(expr) 计算算术表达式。"},
-            {"role": "user", "content": prompt},
-        ]
-        ids = format_chat_prompt(self.tok, messages)
+        enable_thinking = body.get("enable_thinking", None)
+        if body.get("messages"):
+            messages = list(body["messages"])
+            if messages[0].get("role") != "system":
+                messages.insert(0, {"role": "system", "content": SYSTEM_PROMPT})
+        else:
+            messages = [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": body.get("prompt", "")}]
+        ids = format_chat_prompt(self.tok, messages, enable_thinking=enable_thinking)
         turns: list[dict] = []
+        reasonings: list[str] = []
         with self.lock:
-            for _ in range(3):
+            for step_idx in range(3):
                 gen = self._run_tokens(ids, max_tokens, temperature, top_k, self.tok.im_end_id)
                 ids.extend(gen)
                 text, calls, broken = parse_tool_calls(self.tok, gen)
-                _, content = split_thinking(text)
+                if step_idx == 0 and enable_thinking is True and "<think>" not in text and "</think>" in text:
+                    text = "<think>" + text
+                reasoning, content = split_thinking(text)
+                if reasoning:
+                    reasonings.append(reasoning)
                 turn: dict = {"assistant": content, "calls": calls, "broken": broken, "tool_result": ""}
                 if calls:
                     res = "\n".join(execute_tool(c["name"], c["arguments"]) for c in calls)
@@ -197,7 +204,11 @@ class Service:
                 else:
                     turns.append(turn)
                     break
-        return {"turns": turns, "final": turns[-1]["assistant"] if turns else ""}
+        return {
+            "turns": turns,
+            "reasoning_content": "\n".join(reasonings),
+            "final": turns[-1]["assistant"] if turns else "",
+        }
 
 
 def make_handler(svc: Service):
