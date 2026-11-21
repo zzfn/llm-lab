@@ -223,8 +223,17 @@ cache.k, cache.v = k[:, :, keep], v[:, :, keep]  <span class="cm"># 滑动窗口
         <div id="maskTokens" class="tok-wrap" style="margin-top:14px;"></div>
         <p id="maskExplain" class="muted" style="margin-top:12px;"></p>
 
-        <h3 style="margin-top:18px;">五大后训练手段各自干嘛？</h3>
+        <h3 style="margin-top:18px;">三阶段语料长啥样？（Agent 数据飞轮视角）</h3>
         <ul style="padding-left:18px;margin:6px 0;" class="muted">
+          <li><strong>Pretrain 语料（通读万卷书）</strong>：纯网页/百科/代码/书籍文本，无问答格式；训完只会“接着往下编（续写）”，不知道停。</li>
+          <li><strong>SFT 语料（洗干净的成功日志）</strong>：筛选后的优质回答或强模型生成的蒸馏日志（<code>src/fetch_hf.py</code>），<strong>不能把工具报错脏轨迹喂进去</strong>。</li>
+          <li><strong>DPO 语料（好日志 vs 坏日志）</strong>：用户点赞/采纳轨迹作 <code>chosen</code>，点踩/报错轨迹作 <code>rejected</code>。</li>
+          <li><strong>GRPO 语料（只给题目和裁判）</strong>：不依赖现成日志，模型在工具沙箱里自己探索并按结果拿奖惩。</li>
+        </ul>
+
+        <h3 style="margin-top:14px;">五大后训练手段各自干嘛？</h3>
+        <ul style="padding-left:18px;margin:6px 0;" class="muted">
+          <li><strong>黑盒数据蒸馏</strong>（<code>src/fetch_hf.py</code>）：用更强老师模型（如 DeepSeek-R1）生成带 <code>&lt;think&gt;</code> 的标准轨迹喂给 SFT，最快速提分。</li>
           <li><strong>LoRA + Merge</strong>（<code>src/lora.py</code>）：冻结基座，仅训旁路低秩矩阵 <code>B@A</code>（约 2.2% 参数）；<code>B</code> 全零初始化保证初始零扰动，训完可无损合回原矩阵。</li>
           <li><strong>DPO</strong>（<code>src/dpo.py</code>）：拿成对 <code>(chosen, rejected)</code> 数据对比冻结参考模型，直接拉高好回答相对概率。</li>
           <li><strong>MOPD</strong>（<code>src/distill.py</code>）：学生自己生成回答，按题型领域找数学/问答专家老师算全词表反向 KL，避免暴露偏差。</li>
@@ -274,7 +283,7 @@ pg_loss = -(adv[:, <span class="kw">None</span>] * target_lp * mask[:, <span cla
       </div>
       <div class="pitfall red">
         <strong>坑 5：问 <code>1 * 0</code> 时模型自己改写成了 <code>13 * 0</code>，工具返回 <code>0</code> 却答成 <code>003</code></strong><br>
-        <span class="muted">原因：训练集乘法只造了 <code>11..49</code> 两位数，工具结果全是 3~4 位数。小模型遇到没见过的个位数和 <code>0</code>（OOD 分布偏移），连“抄数字”都会强行凑成两位数和三位数！</span>
+        <span class="muted">原因：初版训练集乘法只造了 <code>11..49</code> 两位数，工具结果全是 3~4 位数。小模型遇到没见过的个位数和 <code>0</code>（OOD 分布偏移），连“抄数字”都会强行凑成两位数和三位数（后续已把 <code>data_gen.py</code> 扩展到覆盖 <code>0..49</code> 边界）。</span>
       </div>
       <div class="pitfall">
         <strong>坑 6：保存纯 LoRA 权重时因父目录不存在报错</strong><br>
